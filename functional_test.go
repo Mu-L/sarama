@@ -1,5 +1,4 @@
 //go:build functional
-// +build functional
 
 package sarama
 
@@ -17,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	toxiproxy "github.com/Shopify/toxiproxy/v2/client"
+	"github.com/IBM/sarama/internal/toxiproxy"
 )
 
 const uncommittedTopic = "uncommitted-topic-test-4"
@@ -37,6 +36,10 @@ var (
 			ReplicationFactor: 3,
 		},
 		uncommittedTopic: {
+			NumPartitions:     1,
+			ReplicationFactor: 3,
+		},
+		"test.1_to_2": {
 			NumPartitions:     1,
 			ReplicationFactor: 3,
 		},
@@ -68,7 +71,7 @@ func testMain(m *testing.M) int {
 	var env testEnvironment
 
 	if os.Getenv("DEBUG") == "true" {
-		Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
+		Logger = log.New(os.Stderr, "[DEBUG] ", log.Lmicroseconds|log.Ltime)
 	}
 
 	usingExisting, err := existingEnvironment(ctx, &env)
@@ -88,6 +91,21 @@ func testMain(m *testing.M) int {
 	}
 	FunctionalTestEnv = &env
 	return m.Run()
+}
+
+// NewFunctionalTestConfig returns a config meant to be used by functional tests.
+func NewFunctionalTestConfig() *Config {
+	config := NewConfig()
+	// config.Consumer.Retry.Backoff = 0
+	// config.Producer.Retry.Backoff = 0
+	config.Version = MinVersion
+	version, err := ParseKafkaVersion(os.Getenv("KAFKA_VERSION"))
+	if err != nil {
+		config.Version = DefaultVersion
+	} else {
+		config.Version = version
+	}
+	return config
 }
 
 type testEnvironment struct {
@@ -135,16 +153,19 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 	if version, ok := os.LookupEnv("KAFKA_VERSION"); ok {
 		env.KafkaVersion = version
 	} else {
-		env.KafkaVersion = "3.1.0"
+		env.KafkaVersion = "3.5.1"
 	}
 
-	c := exec.Command("docker-compose", "up", "-d")
+	// docker compose v2.17.0 or newer required for `--wait-timeout` support
+	c := exec.Command(
+		"docker", "compose", "up", "-d", "--quiet-pull", "--timestamps", "--wait", "--wait-timeout", "600",
+	)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Env = append(os.Environ(), fmt.Sprintf("KAFKA_VERSION=%s", env.KafkaVersion))
 	err := c.Run()
 	if err != nil {
-		return fmt.Errorf("failed to run docker-compose to start test environment: %w", err)
+		return fmt.Errorf("failed to run docker compose to start test environment: %w", err)
 	}
 
 	if err := setupToxiProxies(env, "http://localhost:8474"); err != nil {
@@ -159,11 +180,7 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 		return conn.Close()
 	}
 
-	config := NewTestConfig()
-	config.Version, err = ParseKafkaVersion(env.KafkaVersion)
-	if err != nil {
-		return err
-	}
+	config := NewFunctionalTestConfig()
 	config.Net.DialTimeout = 1 * time.Second
 	config.Net.ReadTimeout = 1 * time.Second
 	config.Net.WriteTimeout = 1 * time.Second
@@ -172,9 +189,14 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 	// wait for the kafka brokers to come up
 	allBrokersUp := false
 
+	Logger.Printf("waiting for kafka %s brokers to come up...\n", env.KafkaVersion)
+	time.Sleep(10 * time.Second)
+
 mainLoop:
 	for i := 0; i < 30 && !allBrokersUp; i++ {
-		Logger.Println("waiting for kafka brokers to come up")
+		if i > 0 {
+			Logger.Printf("still waiting for kafka %s brokers to come up...\n", env.KafkaVersion)
+		}
 		time.Sleep(3 * time.Second)
 		brokersOk := make([]bool, len(env.KafkaBrokerAddrs))
 
@@ -195,22 +217,28 @@ mainLoop:
 			}
 			err = client.RefreshMetadata()
 			if err != nil {
+				client.Close()
 				continue
 			}
 			brokers := client.Brokers()
 			if len(brokers) < expectedBrokers {
+				client.Close()
 				continue
 			}
 			for _, broker := range brokers {
 				err := broker.Open(client.Config())
-				if err != nil {
+				if err != nil && !errors.Is(err, ErrAlreadyConnected) {
+					client.Close()
 					continue retryLoop
 				}
 				connected, err := broker.Connected()
 				if err != nil || !connected {
+					broker.Close()
+					client.Close()
 					continue retryLoop
 				}
 			}
+			client.Close()
 			brokersOk[j] = true
 		}
 
@@ -221,7 +249,7 @@ mainLoop:
 	}
 
 	if !allBrokersUp {
-		c := exec.Command("docker-compose", "logs", "-t", "kafka-1", "kafka-2", "kafka-3", "kafka-4", "kafka-5")
+		c := exec.Command("docker", "compose", "logs", "-t", "kafka-1", "kafka-2", "kafka-3", "kafka-4", "kafka-5")
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
 		_ = c.Run()
@@ -252,42 +280,42 @@ func existingEnvironment(ctx context.Context, env *testEnvironment) (bool, error
 }
 
 func tearDownDockerTestEnvironment(ctx context.Context, env *testEnvironment) error {
-	c := exec.Command("docker-compose", "down", "--volumes")
+	c := exec.Command("docker", "compose", "down", "--volumes")
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	downErr := c.Run()
 
-	c = exec.Command("docker-compose", "rm", "-v", "--force", "--stop")
+	c = exec.Command("docker", "compose", "rm", "-v", "--force", "--stop")
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	rmErr := c.Run()
 	if downErr != nil {
-		return fmt.Errorf("failed to run docker-compose to stop test environment: %w", downErr)
+		return fmt.Errorf("failed to run docker compose to stop test environment: %w", downErr)
 	}
 	if rmErr != nil {
-		return fmt.Errorf("failed to run docker-compose to rm test environment: %w", rmErr)
+		return fmt.Errorf("failed to run docker compose to rm test environment: %w", rmErr)
 	}
 	return nil
 }
 
 func startDockerTestBroker(ctx context.Context, brokerID int32) error {
 	service := fmt.Sprintf("kafka-%d", brokerID)
-	c := exec.Command("docker-compose", "start", service)
+	c := exec.Command("docker", "compose", "start", service)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	if err := c.Run(); err != nil {
-		return fmt.Errorf("failed to run docker-compose to start test broker kafka-%d: %w", brokerID, err)
+		return fmt.Errorf("failed to run docker compose to start test broker kafka-%d: %w", brokerID, err)
 	}
 	return nil
 }
 
 func stopDockerTestBroker(ctx context.Context, brokerID int32) error {
 	service := fmt.Sprintf("kafka-%d", brokerID)
-	c := exec.Command("docker-compose", "stop", service)
+	c := exec.Command("docker", "compose", "stop", service)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	if err := c.Run(); err != nil {
-		return fmt.Errorf("failed to run docker-compose to stop test broker kafka-%d: %w", brokerID, err)
+		return fmt.Errorf("failed to run docker compose to stop test broker kafka-%d: %w", brokerID, err)
 	}
 	return nil
 }
@@ -300,15 +328,10 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	}
 
 	Logger.Println("Creating topics")
-	config := NewTestConfig()
+	config := NewFunctionalTestConfig()
 	config.Metadata.Retry.Max = 5
 	config.Metadata.Retry.Backoff = 10 * time.Second
 	config.ClientID = "sarama-prepareTestTopics"
-	var err error
-	config.Version, err = ParseKafkaVersion(env.KafkaVersion)
-	if err != nil {
-		return fmt.Errorf("failed to parse kafka version %s: %w", env.KafkaVersion, err)
-	}
 
 	client, err := NewClient(env.KafkaBrokerAddrs, config)
 	if err != nil {
@@ -323,16 +346,16 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	defer controller.Close()
 
 	// Start by deleting the test topics (if they already exist)
-	deleteRes, err := controller.DeleteTopics(&DeleteTopicsRequest{
-		Topics:  testTopicNames,
-		Timeout: time.Minute,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to delete test topics: %w", err)
-	}
-	for topic, topicErr := range deleteRes.TopicErrorCodes {
-		if !isTopicNotExistsErrorOrOk(topicErr) {
-			return fmt.Errorf("failed to delete topic %s: %w", topic, topicErr)
+	{
+		request := NewDeleteTopicsRequest(config.Version, testTopicNames, time.Minute)
+		deleteRes, err := controller.DeleteTopics(request)
+		if err != nil {
+			return fmt.Errorf("failed to delete test topics: %w", err)
+		}
+		for topic, topicErr := range deleteRes.TopicErrorCodes {
+			if !isTopicNotExistsErrorOrOk(topicErr) {
+				return fmt.Errorf("failed to delete topic %s: %w", topic, topicErr)
+			}
 		}
 	}
 
@@ -340,11 +363,10 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	// synchronously
 	{
 		var topicsOk bool
+		request := NewMetadataRequest(config.Version, testTopicNames)
 		for i := 0; i < 60 && !topicsOk; i++ {
 			time.Sleep(1 * time.Second)
-			md, err := controller.GetMetadata(&MetadataRequest{
-				Topics: testTopicNames,
-			})
+			md, err := controller.GetMetadata(request)
 			if err != nil {
 				return fmt.Errorf("failed to get metadata for test topics: %w", err)
 			}
@@ -364,16 +386,16 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	}
 
 	// now create the topics empty
-	createRes, err := controller.CreateTopics(&CreateTopicsRequest{
-		TopicDetails: testTopicDetails,
-		Timeout:      time.Minute,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create test topics: %w", err)
-	}
-	for topic, topicErr := range createRes.TopicErrors {
-		if !isTopicExistsErrorOrOk(topicErr.Err) {
-			return fmt.Errorf("failed to create test topic %s: %w", topic, topicErr)
+	{
+		request := NewCreateTopicsRequest(config.Version, testTopicDetails, time.Minute)
+		createRes, err := controller.CreateTopics(request)
+		if err != nil {
+			return fmt.Errorf("failed to create test topics: %w", err)
+		}
+		for topic, topicErr := range createRes.TopicErrors {
+			if !isTopicExistsErrorOrOk(topicErr.Err) {
+				return fmt.Errorf("failed to create test topic %s: %w", topic, topicErr)
+			}
 		}
 	}
 
@@ -381,11 +403,10 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	// synchronously
 	{
 		var topicsOk bool
+		request := NewMetadataRequest(config.Version, testTopicNames)
 		for i := 0; i < 60 && !topicsOk; i++ {
 			time.Sleep(1 * time.Second)
-			md, err := controller.GetMetadata(&MetadataRequest{
-				Topics: testTopicNames,
-			})
+			md, err := controller.GetMetadata(request)
 			if err != nil {
 				return fmt.Errorf("failed to get metadata for test topics: %w", err)
 			}
@@ -435,17 +456,73 @@ func resetProxies(t testing.TB) {
 }
 
 func SaveProxy(t *testing.T, px string) {
-	if err := FunctionalTestEnv.Proxies[px].Save(); err != nil {
+	if _, err := FunctionalTestEnv.Proxies[px].Save(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func setupFunctionalTest(t testing.TB) {
 	resetProxies(t)
+	ensureFullyReplicated(t, 60*time.Second, 5*time.Second)
 }
 
 func teardownFunctionalTest(t testing.TB) {
 	resetProxies(t)
+}
+
+func ensureFullyReplicated(t testing.TB, timeout time.Duration, retry time.Duration) {
+	config := NewFunctionalTestConfig()
+	config.Metadata.Full = false
+	config.Metadata.RefreshFrequency = 0
+	config.Metadata.Retry.Max = 5
+	config.Metadata.Retry.Backoff = 10 * time.Second
+	config.ClientID = "sarama-ensureFullyReplicated"
+	config.ApiVersionsRequest = false
+
+	var testTopicNames []string
+	for topic := range testTopicDetails {
+		testTopicNames = append(testTopicNames, topic)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	tick := time.NewTicker(retry)
+	defer tick.Stop()
+
+	for {
+		resp, err := func() (*MetadataResponse, error) {
+			client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to kafka: %w", err)
+			}
+			defer client.Close()
+			broker := client.LeastLoadedBroker()
+			defer broker.Close()
+			request := NewMetadataRequest(config.Version, testTopicNames)
+			return broker.GetMetadata(request)
+		}()
+		if err != nil {
+			Logger.Printf("failed to get metadata during test setup: %v\n", err)
+		} else {
+			ok := true
+			for _, topic := range resp.Topics {
+				for _, partition := range topic.Partitions {
+					if len(partition.Isr) != 3 {
+						ok = false
+						Logger.Printf("topic %s/%d is not fully-replicated Isr=%v Offline=%v\n", topic.Name, partition.ID, partition.Isr, partition.OfflineReplicas)
+					}
+				}
+			}
+			if ok {
+				return
+			}
+		}
+		select {
+		case <-timer.C:
+			t.Fatalf("timeout waiting for test topics to be fully replicated")
+		case <-tick.C:
+		}
+	}
 }
 
 type kafkaVersion []int

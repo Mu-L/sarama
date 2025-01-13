@@ -1,6 +1,6 @@
 package sarama
 
-// DescribeAclsRequest is a secribe acl request type
+// DescribeAclsRequest is a describe acl request type
 type DescribeAclsRequest struct {
 	Version int
 	AclFilter
@@ -27,6 +27,10 @@ func (d *DescribeAclsRequest) version() int16 {
 
 func (d *DescribeAclsRequest) headerVersion() int16 {
 	return 1
+}
+
+func (d *DescribeAclsRequest) isValidVersion() bool {
+	return d.Version >= 0 && d.Version <= 1
 }
 
 func (d *DescribeAclsRequest) requiredVersion() KafkaVersion {

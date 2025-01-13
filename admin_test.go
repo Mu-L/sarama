@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -41,7 +43,10 @@ func TestClusterAdminInvalidController(t *testing.T) {
 
 	config := NewTestConfig()
 	config.Version = V1_0_0_0
-	_, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if admin != nil {
+		defer safeClose(t, admin)
+	}
 	if err == nil {
 		t.Fatal(errors.New("controller not set still cluster admin was created"))
 	}
@@ -161,7 +166,7 @@ func TestClusterAdminListTopics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(entries) <= 0 {
+	if len(entries) == 0 {
 		t.Fatal(errors.New("no resource present"))
 	}
 
@@ -237,6 +242,35 @@ func TestClusterAdminDeleteEmptyTopic(t *testing.T) {
 
 	err = admin.DeleteTopic("")
 	if !errors.Is(err, ErrInvalidTopic) {
+		t.Fatal(err)
+	}
+
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterAdminDeleteTopicError(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(seedBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
+		"DeleteTopicsRequest": NewMockDeleteTopicsResponse(t).SetError(ErrTopicDeletionDisabled),
+	})
+
+	config := NewTestConfig()
+	config.Version = V0_10_2_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = admin.DeleteTopic("my_topic")
+	if !errors.Is(err, ErrTopicDeletionDisabled) {
 		t.Fatal(err)
 	}
 
@@ -447,10 +481,10 @@ func TestClusterAdminListPartitionReassignments(t *testing.T) {
 	partitionStatus, ok := response["my_topic"]
 	if !ok {
 		t.Fatalf("topic missing in response")
-	} else {
-		if len(partitionStatus) != 2 {
-			t.Fatalf("partition missing in response")
-		}
+	}
+
+	if len(partitionStatus) != 2 {
+		t.Fatalf("partition missing in response")
 	}
 
 	err = admin.Close()
@@ -711,47 +745,49 @@ func TestClusterAdminDescribeConfig(t *testing.T) {
 		{V2_0_0_0, 2, true},
 	}
 	for _, tt := range tests {
-		config := NewTestConfig()
-		config.Version = tt.saramaVersion
-		admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			_ = admin.Close()
-		}()
-
-		resource := ConfigResource{
-			Name:        "r1",
-			Type:        TopicResource,
-			ConfigNames: []string{"my_topic"},
-		}
-
-		entries, err := admin.DescribeConfig(resource)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		history := seedBroker.History()
-		describeReq, ok := history[len(history)-1].Request.(*DescribeConfigsRequest)
-		if !ok {
-			t.Fatal("failed to find DescribeConfigsRequest in mockBroker history")
-		}
-
-		if describeReq.Version != tt.requestVersion {
-			t.Fatalf(
-				"requestVersion %v did not match expected %v",
-				describeReq.Version, tt.requestVersion)
-		}
-
-		if len(entries) <= 0 {
-			t.Fatal(errors.New("no resource present"))
-		}
-		if tt.includeSynonyms {
-			if len(entries[0].Synonyms) == 0 {
-				t.Fatal("expected synonyms to have been included")
+		t.Run(tt.saramaVersion.String(), func(t *testing.T) {
+			config := NewTestConfig()
+			config.Version = tt.saramaVersion
+			admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
+			defer func() {
+				_ = admin.Close()
+			}()
+
+			resource := ConfigResource{
+				Name:        "r1",
+				Type:        TopicResource,
+				ConfigNames: []string{"my_topic"},
+			}
+
+			entries, err := admin.DescribeConfig(resource)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			history := seedBroker.History()
+			describeReq, ok := history[len(history)-1].Request.(*DescribeConfigsRequest)
+			if !ok {
+				t.Fatal("failed to find DescribeConfigsRequest in mockBroker history")
+			}
+
+			if describeReq.Version != tt.requestVersion {
+				t.Fatalf(
+					"requestVersion %v did not match expected %v",
+					describeReq.Version, tt.requestVersion)
+			}
+
+			if len(entries) == 0 {
+				t.Fatal(errors.New("no resource present"))
+			}
+			if tt.includeSynonyms {
+				if len(entries[0].Synonyms) == 0 {
+					t.Fatal("expected synonyms to have been included")
+				}
+			}
+		})
 	}
 }
 
@@ -829,7 +865,7 @@ func TestClusterAdminDescribeBrokerConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if len(entries) <= 0 {
+		if len(entries) == 0 {
 			t.Fatal(errors.New("no resource present"))
 		}
 	}
@@ -1245,7 +1281,7 @@ func TestClusterAdminListAcls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rAcls) <= 0 {
+	if len(rAcls) == 0 {
 		t.Fatal("no acls present")
 	}
 
@@ -1283,6 +1319,45 @@ func TestClusterAdminDeleteAcl(t *testing.T) {
 	_, err = admin.DeleteACL(filter, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestElectLeaders(t *testing.T) {
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+
+	broker.SetHandlerByMap(map[string]MockResponse{
+		"ApiVersionsRequest": NewMockApiVersionsResponse(t),
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(broker.BrokerID()).
+			SetBroker(broker.Addr(), broker.BrokerID()),
+		"ElectLeadersRequest": NewMockElectLeadersResponse(t),
+	})
+
+	config := NewTestConfig()
+	config.Version = V2_4_0_0
+	admin, err := NewClusterAdmin([]string{broker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := admin.ElectLeaders(PreferredElection, map[string][]int32{"my_topic": {0, 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partitionResult, ok := response["my_topic"]
+	if !ok {
+		t.Fatalf("topic missing in response")
+	}
+
+	if len(partitionResult) != 1 {
+		t.Fatalf("partition missing in response")
 	}
 
 	err = admin.Close()
@@ -1678,11 +1753,15 @@ func TestRefreshMetaDataWithDifferentController(t *testing.T) {
 			seedBroker1.BrokerID(), b.ID())
 	}
 
+	metadataResponse := NewMockMetadataResponse(t).
+		SetController(seedBroker2.BrokerID()).
+		SetBroker(seedBroker1.Addr(), seedBroker1.BrokerID()).
+		SetBroker(seedBroker2.Addr(), seedBroker2.BrokerID())
 	seedBroker1.SetHandlerByMap(map[string]MockResponse{
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetController(seedBroker2.BrokerID()).
-			SetBroker(seedBroker1.Addr(), seedBroker1.BrokerID()).
-			SetBroker(seedBroker2.Addr(), seedBroker2.BrokerID()),
+		"MetadataRequest": metadataResponse,
+	})
+	seedBroker2.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": metadataResponse,
 	})
 
 	if b, _ := ca.refreshController(); seedBroker2.BrokerID() != b.ID() {
@@ -1763,6 +1842,7 @@ func TestDescribeLogDirsUnknownBroker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer safeClose(t, admin)
 
 	type result struct {
 		metadata map[int32][]DescribeLogDirsResponseDirMetadata
@@ -1787,4 +1867,74 @@ func TestDescribeLogDirsUnknownBroker(t *testing.T) {
 			t.Fatalf("Expected no error, got %v", returned.err)
 		}
 	}
+}
+
+func Test_retryOnError(t *testing.T) {
+	testBackoffTime := 100 * time.Millisecond
+	config := NewTestConfig()
+	config.Version = V1_0_0_0
+	config.Admin.Retry.Max = 3
+	config.Admin.Retry.Backoff = testBackoffTime
+
+	admin := &clusterAdmin{conf: config}
+
+	t.Run("immediate success", func(t *testing.T) {
+		startTime := time.Now()
+		attempts := 0
+		err := admin.retryOnError(
+			func(error) bool { return true },
+			func() error {
+				attempts++
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("expected no error but was %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("expected 1 attempt to have been made but was %d", attempts)
+		}
+		if time.Since(startTime) >= testBackoffTime {
+			t.Fatalf("single attempt should take less than backoff time")
+		}
+	})
+
+	t.Run("immediate failure", func(t *testing.T) {
+		startTime := time.Now()
+		attempts := 0
+		err := admin.retryOnError(
+			func(error) bool { return false },
+			func() error {
+				attempts++
+				return errors.New("mock error")
+			})
+		if err == nil {
+			t.Fatalf("expected error but was nil")
+		}
+		if attempts != 1 {
+			t.Fatalf("expected 1 attempt to have been made but was %d", attempts)
+		}
+		if time.Since(startTime) >= testBackoffTime {
+			t.Fatalf("single attempt should take less than backoff time")
+		}
+	})
+
+	t.Run("failing all attempts", func(t *testing.T) {
+		startTime := time.Now()
+		attempts := 0
+		err := admin.retryOnError(
+			func(error) bool { return true },
+			func() error {
+				attempts++
+				return errors.New("mock error")
+			})
+		if err == nil {
+			t.Errorf("expected error but was nil")
+		}
+		if attempts != 4 {
+			t.Errorf("expected 4 attempts to have been made but was %d", attempts)
+		}
+		if time.Since(startTime) >= 4*testBackoffTime {
+			t.Errorf("attempt+sleep+retry+sleep+retry+sleep+retry should take less than 4 * backoff time")
+		}
+	})
 }

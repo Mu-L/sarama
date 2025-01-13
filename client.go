@@ -1,12 +1,18 @@
 package sarama
 
 import (
+	"context"
 	"errors"
+	"math"
 	"math/rand"
+	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // Client is a generic Kafka client. It manages connections to one or more Kafka brokers.
@@ -49,6 +55,10 @@ type Client interface {
 	// topic/partition, as determined by querying the cluster metadata.
 	Leader(topic string, partitionID int32) (*Broker, error)
 
+	// LeaderAndEpoch returns the leader and its epoch for the current
+	// topic/partition, as determined by querying the cluster metadata.
+	LeaderAndEpoch(topic string, partitionID int32) (*Broker, int32, error)
+
 	// Replicas returns the set of all replica IDs for the given partition.
 	Replicas(topic string, partitionID int32) ([]int32, error)
 
@@ -87,8 +97,21 @@ type Client interface {
 	// in local cache. This function only works on Kafka 0.8.2 and higher.
 	RefreshCoordinator(consumerGroup string) error
 
+	// Coordinator returns the coordinating broker for a transaction id. It will
+	// return a locally cached value if it's available. You can call
+	// RefreshCoordinator to update the cached value. This function only works on
+	// Kafka 0.11.0.0 and higher.
+	TransactionCoordinator(transactionID string) (*Broker, error)
+
+	// RefreshCoordinator retrieves the coordinator for a transaction id and stores it
+	// in local cache. This function only works on Kafka 0.11.0.0 and higher.
+	RefreshTransactionCoordinator(transactionID string) error
+
 	// InitProducerID retrieves information required for Idempotent Producer
 	InitProducerID() (*InitProducerIDResponse, error)
+
+	// LeastLoadedBroker retrieves broker that has the least responses pending
+	LeastLoadedBroker() *Broker
 
 	// Close shuts down all broker connections managed by this client. It is required
 	// to call this function before a client object passes out of scope, as it will
@@ -114,6 +137,11 @@ const (
 )
 
 type client struct {
+	// updateMetadataMs stores the time at which metadata was lasted updated.
+	// Note: this accessed atomically so must be the first word in the struct
+	// as per golang/go#41970
+	updateMetadataMs int64
+
 	conf           *Config
 	closer, closed chan none // for shutting down background metadata updater
 
@@ -123,19 +151,18 @@ type client struct {
 	seedBrokers []*Broker
 	deadSeeds   []*Broker
 
-	controllerID   int32                                   // cluster controller broker id
-	brokers        map[int32]*Broker                       // maps broker ids to brokers
-	metadata       map[string]map[int32]*PartitionMetadata // maps topics to partition ids to metadata
-	metadataTopics map[string]none                         // topics that need to collect metadata
-	coordinators   map[string]int32                        // Maps consumer group names to coordinating broker IDs
+	controllerID            int32                                   // cluster controller broker id
+	brokers                 map[int32]*Broker                       // maps broker ids to brokers
+	metadata                map[string]map[int32]*PartitionMetadata // maps topics to partition ids to metadata
+	metadataTopics          map[string]none                         // topics that need to collect metadata
+	coordinators            map[string]int32                        // Maps consumer group names to coordinating broker IDs
+	transactionCoordinators map[string]int32                        // Maps transaction ids to coordinating broker IDs
 
 	// If the number of partitions is large, we can get some churn calling cachedPartitions,
 	// so the result is cached.  It is important to update this value whenever metadata is changed
 	cachedPartitionsResults map[string][maxPartitionIndex][]int32
 
 	lock sync.RWMutex // protects access to the maps that hold cluster state.
-
-	updateMetaDataMs int64 //store update metadata time
 }
 
 // NewClient creates a new Client. It connects to one of the given broker addresses
@@ -156,6 +183,13 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		return nil, ConfigurationError("You must provide at least one broker address")
 	}
 
+	if strings.Contains(addrs[0], ".servicebus.windows.net") {
+		if conf.Version.IsAtLeast(V1_1_0_0) || !conf.Version.IsAtLeast(V0_11_0_0) {
+			Logger.Println("Connecting to Azure Event Hubs, forcing version to V1_0_0_0 for compatibility")
+			conf.Version = V1_0_0_0
+		}
+	}
+
 	client := &client{
 		conf:                    conf,
 		closer:                  make(chan none),
@@ -165,6 +199,15 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		metadataTopics:          make(map[string]none),
 		cachedPartitionsResults: make(map[string][maxPartitionIndex][]int32),
 		coordinators:            make(map[string]int32),
+		transactionCoordinators: make(map[string]int32),
+	}
+
+	if conf.Net.ResolveCanonicalBootstrapServers {
+		var err error
+		addrs, err = client.resolveCanonicalNames(addrs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	client.randomizeSeedBrokers(addrs)
@@ -215,12 +258,26 @@ func (client *client) Broker(brokerID int32) (*Broker, error) {
 }
 
 func (client *client) InitProducerID() (*InitProducerIDResponse, error) {
+	// FIXME: this InitProducerID seems to only be called from client_test.go (TestInitProducerIDConnectionRefused) and has been superceded by transaction_manager.go?
 	brokerErrors := make([]error, 0)
-	for broker := client.anyBroker(); broker != nil; broker = client.anyBroker() {
-		var response *InitProducerIDResponse
-		req := &InitProducerIDRequest{}
+	for broker := client.LeastLoadedBroker(); broker != nil; broker = client.LeastLoadedBroker() {
+		request := &InitProducerIDRequest{}
 
-		response, err := broker.InitProducerID(req)
+		if client.conf.Version.IsAtLeast(V2_7_0_0) {
+			// Version 4 adds the support for new error code PRODUCER_FENCED.
+			request.Version = 4
+		} else if client.conf.Version.IsAtLeast(V2_5_0_0) {
+			// Version 3 adds ProducerId and ProducerEpoch, allowing producers to try to resume after an INVALID_PRODUCER_EPOCH error
+			request.Version = 3
+		} else if client.conf.Version.IsAtLeast(V2_4_0_0) {
+			// Version 2 is the first flexible version.
+			request.Version = 2
+		} else if client.conf.Version.IsAtLeast(V2_0_0_0) {
+			// Version 1 is the same as version 0.
+			request.Version = 1
+		}
+
+		response, err := broker.InitProducerID(request)
 		if err == nil {
 			return response, nil
 		} else {
@@ -306,34 +363,19 @@ func (client *client) MetadataTopics() ([]string, error) {
 }
 
 func (client *client) Partitions(topic string) ([]int32, error) {
-	if client.Closed() {
-		return nil, ErrClosedClient
-	}
-
-	partitions := client.cachedPartitions(topic, allPartitions)
-
-	if len(partitions) == 0 {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
-		partitions = client.cachedPartitions(topic, allPartitions)
-	}
-
-	// no partitions found after refresh metadata
-	if len(partitions) == 0 {
-		return nil, ErrUnknownTopicOrPartition
-	}
-
-	return partitions, nil
+	return client.getPartitions(topic, allPartitions)
 }
 
 func (client *client) WritablePartitions(topic string) ([]int32, error) {
+	return client.getPartitions(topic, writablePartitions)
+}
+
+func (client *client) getPartitions(topic string, pt partitionType) ([]int32, error) {
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
 
-	partitions := client.cachedPartitions(topic, writablePartitions)
+	partitions := client.cachedPartitions(topic, pt)
 
 	// len==0 catches when it's nil (no such topic) and the odd case when every single
 	// partition is undergoing leader election simultaneously. Callers have to be able to handle
@@ -346,7 +388,7 @@ func (client *client) WritablePartitions(topic string) ([]int32, error) {
 		if err != nil {
 			return nil, err
 		}
-		partitions = client.cachedPartitions(topic, writablePartitions)
+		partitions = client.cachedPartitions(topic, pt)
 	}
 
 	if partitions == nil {
@@ -357,56 +399,24 @@ func (client *client) WritablePartitions(topic string) ([]int32, error) {
 }
 
 func (client *client) Replicas(topic string, partitionID int32) ([]int32, error) {
-	if client.Closed() {
-		return nil, ErrClosedClient
-	}
-
-	metadata := client.cachedMetadata(topic, partitionID)
-
-	if metadata == nil {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
-		metadata = client.cachedMetadata(topic, partitionID)
-	}
-
-	if metadata == nil {
-		return nil, ErrUnknownTopicOrPartition
-	}
-
-	if errors.Is(metadata.Err, ErrReplicaNotAvailable) {
-		return dupInt32Slice(metadata.Replicas), metadata.Err
-	}
-	return dupInt32Slice(metadata.Replicas), nil
+	return client.getReplicas(topic, partitionID, func(metadata *PartitionMetadata) []int32 {
+		return metadata.Replicas
+	})
 }
 
 func (client *client) InSyncReplicas(topic string, partitionID int32) ([]int32, error) {
-	if client.Closed() {
-		return nil, ErrClosedClient
-	}
-
-	metadata := client.cachedMetadata(topic, partitionID)
-
-	if metadata == nil {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
-		metadata = client.cachedMetadata(topic, partitionID)
-	}
-
-	if metadata == nil {
-		return nil, ErrUnknownTopicOrPartition
-	}
-
-	if errors.Is(metadata.Err, ErrReplicaNotAvailable) {
-		return dupInt32Slice(metadata.Isr), metadata.Err
-	}
-	return dupInt32Slice(metadata.Isr), nil
+	return client.getReplicas(topic, partitionID, func(metadata *PartitionMetadata) []int32 {
+		return metadata.Isr
+	})
 }
 
 func (client *client) OfflineReplicas(topic string, partitionID int32) ([]int32, error) {
+	return client.getReplicas(topic, partitionID, func(metadata *PartitionMetadata) []int32 {
+		return metadata.OfflineReplicas
+	})
+}
+
+func (client *client) getReplicas(topic string, partitionID int32, extractor func(metadata *PartitionMetadata) []int32) ([]int32, error) {
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
@@ -425,28 +435,33 @@ func (client *client) OfflineReplicas(topic string, partitionID int32) ([]int32,
 		return nil, ErrUnknownTopicOrPartition
 	}
 
+	replicas := extractor(metadata)
 	if errors.Is(metadata.Err, ErrReplicaNotAvailable) {
-		return dupInt32Slice(metadata.OfflineReplicas), metadata.Err
+		return dupInt32Slice(replicas), metadata.Err
 	}
-	return dupInt32Slice(metadata.OfflineReplicas), nil
+	return dupInt32Slice(replicas), nil
 }
 
 func (client *client) Leader(topic string, partitionID int32) (*Broker, error) {
+	leader, _, err := client.LeaderAndEpoch(topic, partitionID)
+	return leader, err
+}
+
+func (client *client) LeaderAndEpoch(topic string, partitionID int32) (*Broker, int32, error) {
 	if client.Closed() {
-		return nil, ErrClosedClient
+		return nil, -1, ErrClosedClient
 	}
 
-	leader, err := client.cachedLeader(topic, partitionID)
-
+	leader, epoch, err := client.cachedLeader(topic, partitionID)
 	if leader == nil {
 		err = client.RefreshMetadata(topic)
 		if err != nil {
-			return nil, err
+			return nil, -1, err
 		}
-		leader, err = client.cachedLeader(topic, partitionID)
+		leader, epoch, err = client.cachedLeader(topic, partitionID)
 	}
 
-	return leader, err
+	return leader, epoch, err
 }
 
 func (client *client) RefreshBrokers(addrs []string) error {
@@ -458,16 +473,16 @@ func (client *client) RefreshBrokers(addrs []string) error {
 	defer client.lock.Unlock()
 
 	for _, broker := range client.brokers {
-		_ = broker.Close()
-		delete(client.brokers, broker.ID())
+		safeAsyncClose(broker)
 	}
+	client.brokers = make(map[int32]*Broker)
 
 	for _, broker := range client.seedBrokers {
-		_ = broker.Close()
+		safeAsyncClose(broker)
 	}
 
 	for _, broker := range client.deadSeeds {
-		_ = broker.Close()
+		safeAsyncClose(broker)
 	}
 
 	client.seedBrokers = nil
@@ -485,7 +500,7 @@ func (client *client) RefreshMetadata(topics ...string) error {
 
 	// Prior to 0.8.2, Kafka will throw exceptions on an empty topic and not return a proper
 	// error. This handles the case by returning an error instead of sending it
-	// off to Kafka. See: https://github.com/Shopify/sarama/pull/38#issuecomment-26362310
+	// off to Kafka. See: https://github.com/IBM/sarama/pull/38#issuecomment-26362310
 	for _, topic := range topics {
 		if topic == "" {
 			return ErrInvalidTopic // this is the error that 0.8.2 and later correctly return
@@ -499,17 +514,17 @@ func (client *client) RefreshMetadata(topics ...string) error {
 	return client.tryRefreshMetadata(topics, client.conf.Metadata.Retry.Max, deadline)
 }
 
-func (client *client) GetOffset(topic string, partitionID int32, time int64) (int64, error) {
+func (client *client) GetOffset(topic string, partitionID int32, timestamp int64) (int64, error) {
 	if client.Closed() {
 		return -1, ErrClosedClient
 	}
 
-	offset, err := client.getOffset(topic, partitionID, time)
+	offset, err := client.getOffset(topic, partitionID, timestamp)
 	if err != nil {
 		if err := client.RefreshMetadata(topic); err != nil {
 			return -1, err
 		}
-		return client.getOffset(topic, partitionID, time)
+		return client.getOffset(topic, partitionID, timestamp)
 	}
 
 	return offset, err
@@ -599,7 +614,7 @@ func (client *client) RefreshCoordinator(consumerGroup string) error {
 		return ErrClosedClient
 	}
 
-	response, err := client.getConsumerMetadata(consumerGroup, client.conf.Metadata.Retry.Max)
+	response, err := client.findCoordinator(consumerGroup, CoordinatorGroup, client.conf.Metadata.Retry.Max)
 	if err != nil {
 		return err
 	}
@@ -608,6 +623,45 @@ func (client *client) RefreshCoordinator(consumerGroup string) error {
 	defer client.lock.Unlock()
 	client.registerBroker(response.Coordinator)
 	client.coordinators[consumerGroup] = response.Coordinator.ID()
+	return nil
+}
+
+func (client *client) TransactionCoordinator(transactionID string) (*Broker, error) {
+	if client.Closed() {
+		return nil, ErrClosedClient
+	}
+
+	coordinator := client.cachedTransactionCoordinator(transactionID)
+
+	if coordinator == nil {
+		if err := client.RefreshTransactionCoordinator(transactionID); err != nil {
+			return nil, err
+		}
+		coordinator = client.cachedTransactionCoordinator(transactionID)
+	}
+
+	if coordinator == nil {
+		return nil, ErrConsumerCoordinatorNotAvailable
+	}
+
+	_ = coordinator.Open(client.conf)
+	return coordinator, nil
+}
+
+func (client *client) RefreshTransactionCoordinator(transactionID string) error {
+	if client.Closed() {
+		return ErrClosedClient
+	}
+
+	response, err := client.findCoordinator(transactionID, CoordinatorTransaction, client.conf.Metadata.Retry.Max)
+	if err != nil {
+		return err
+	}
+
+	client.lock.Lock()
+	defer client.lock.Unlock()
+	client.registerBroker(response.Coordinator)
+	client.transactionCoordinators[transactionID] = response.Coordinator.ID()
 	return nil
 }
 
@@ -663,22 +717,21 @@ func (client *client) registerBroker(broker *Broker) {
 	}
 }
 
-// deregisterBroker removes a broker from the seedsBroker list, and if it's
-// not the seedbroker, removes it from brokers map completely.
+// deregisterBroker removes a broker from the broker list, and if it's
+// not in the broker list, removes it from seedBrokers.
 func (client *client) deregisterBroker(broker *Broker) {
 	client.lock.Lock()
 	defer client.lock.Unlock()
 
+	_, ok := client.brokers[broker.ID()]
+	if ok {
+		Logger.Printf("client/brokers deregistered broker #%d at %s", broker.ID(), broker.Addr())
+		delete(client.brokers, broker.ID())
+		return
+	}
 	if len(client.seedBrokers) > 0 && broker == client.seedBrokers[0] {
 		client.deadSeeds = append(client.deadSeeds, broker)
 		client.seedBrokers = client.seedBrokers[1:]
-	} else {
-		// we do this so that our loop in `tryRefreshMetadata` doesn't go on forever,
-		// but we really shouldn't have to; once that loop is made better this case can be
-		// removed, and the function generally can be renamed from `deregisterBroker` to
-		// `nextSeedBroker` or something
-		DebugLogger.Printf("client/brokers deregistered broker #%d at %s", broker.ID(), broker.Addr())
-		delete(client.brokers, broker.ID())
 	}
 }
 
@@ -691,22 +744,31 @@ func (client *client) resurrectDeadBrokers() {
 	client.deadSeeds = nil
 }
 
-func (client *client) anyBroker() *Broker {
+// LeastLoadedBroker returns the broker with the least pending requests.
+// Firstly, choose the broker from cached broker list. If the broker list is empty, choose from seed brokers.
+func (client *client) LeastLoadedBroker() *Broker {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
+
+	var leastLoadedBroker *Broker
+	pendingRequests := math.MaxInt
+	for _, broker := range client.brokers {
+		if pendingRequests > broker.ResponseSize() {
+			pendingRequests = broker.ResponseSize()
+			leastLoadedBroker = broker
+		}
+	}
+	if leastLoadedBroker != nil {
+		_ = leastLoadedBroker.Open(client.conf)
+		return leastLoadedBroker
+	}
 
 	if len(client.seedBrokers) > 0 {
 		_ = client.seedBrokers[0].Open(client.conf)
 		return client.seedBrokers[0]
 	}
 
-	// not guaranteed to be random *or* deterministic
-	for _, broker := range client.brokers {
-		_ = broker.Open(client.conf)
-		return broker
-	}
-
-	return nil
+	return leastLoadedBroker
 }
 
 // private caching/lazy metadata helpers
@@ -765,7 +827,7 @@ func (client *client) setPartitionCache(topic string, partitionSet partitionType
 	return ret
 }
 
-func (client *client) cachedLeader(topic string, partitionID int32) (*Broker, error) {
+func (client *client) cachedLeader(topic string, partitionID int32) (*Broker, int32, error) {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
 
@@ -774,31 +836,43 @@ func (client *client) cachedLeader(topic string, partitionID int32) (*Broker, er
 		metadata, ok := partitions[partitionID]
 		if ok {
 			if errors.Is(metadata.Err, ErrLeaderNotAvailable) {
-				return nil, ErrLeaderNotAvailable
+				return nil, -1, ErrLeaderNotAvailable
 			}
 			b := client.brokers[metadata.Leader]
 			if b == nil {
-				return nil, ErrLeaderNotAvailable
+				return nil, -1, ErrLeaderNotAvailable
 			}
 			_ = b.Open(client.conf)
-			return b, nil
+			return b, metadata.LeaderEpoch, nil
 		}
 	}
 
-	return nil, ErrUnknownTopicOrPartition
+	return nil, -1, ErrUnknownTopicOrPartition
 }
 
-func (client *client) getOffset(topic string, partitionID int32, time int64) (int64, error) {
+func (client *client) getOffset(topic string, partitionID int32, timestamp int64) (int64, error) {
 	broker, err := client.Leader(topic, partitionID)
 	if err != nil {
 		return -1, err
 	}
 
 	request := &OffsetRequest{}
-	if client.conf.Version.IsAtLeast(V0_10_1_0) {
+	if client.conf.Version.IsAtLeast(V2_1_0_0) {
+		// Version 4 adds the current leader epoch, which is used for fencing.
+		request.Version = 4
+	} else if client.conf.Version.IsAtLeast(V2_0_0_0) {
+		// Version 3 is the same as version 2.
+		request.Version = 3
+	} else if client.conf.Version.IsAtLeast(V0_11_0_0) {
+		// Version 2 adds the isolation level, which is used for transactional reads.
+		request.Version = 2
+	} else if client.conf.Version.IsAtLeast(V0_10_1_0) {
+		// Version 1 removes MaxNumOffsets.  From this version forward, only a single
+		// offset can be returned.
 		request.Version = 1
 	}
-	request.AddBlock(topic, partitionID, time, 1)
+
+	request.AddBlock(topic, partitionID, timestamp, 1)
 
 	response, err := broker.GetAvailableOffsets(request)
 	if err != nil {
@@ -884,20 +958,21 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 				time.Sleep(backoff)
 			}
 
-			t := atomic.LoadInt64(&client.updateMetaDataMs)
-			if time.Since(time.Unix(t/1e3, 0)) < backoff {
+			t := atomic.LoadInt64(&client.updateMetadataMs)
+			if time.Since(time.UnixMilli(t)) < backoff {
 				return err
 			}
+			attemptsRemaining--
 			Logger.Printf("client/metadata retrying after %dms... (%d attempts remaining)\n", backoff/time.Millisecond, attemptsRemaining)
 
-			return client.tryRefreshMetadata(topics, attemptsRemaining-1, deadline)
+			return client.tryRefreshMetadata(topics, attemptsRemaining, deadline)
 		}
 		return err
 	}
 
-	broker := client.anyBroker()
+	broker := client.LeastLoadedBroker()
 	brokerErrors := make([]error, 0)
-	for ; broker != nil && !pastDeadline(0); broker = client.anyBroker() {
+	for ; broker != nil && !pastDeadline(0); broker = client.LeastLoadedBroker() {
 		allowAutoTopicCreation := client.conf.Metadata.AllowAutoTopicCreation
 		if len(topics) > 0 {
 			DebugLogger.Printf("client/metadata fetching metadata for %v from broker %s\n", topics, broker.addr)
@@ -906,22 +981,21 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			DebugLogger.Printf("client/metadata fetching metadata for all topics from broker %s\n", broker.addr)
 		}
 
-		req := &MetadataRequest{Topics: topics, AllowAutoTopicCreation: allowAutoTopicCreation}
-		if client.conf.Version.IsAtLeast(V1_0_0_0) {
-			req.Version = 5
-		} else if client.conf.Version.IsAtLeast(V0_10_0_0) {
-			req.Version = 1
-		}
-
-		t := atomic.LoadInt64(&client.updateMetaDataMs)
-		if !atomic.CompareAndSwapInt64(&client.updateMetaDataMs, t, time.Now().UnixNano()/int64(time.Millisecond)) {
-			return nil
-		}
+		req := NewMetadataRequest(client.conf.Version, topics)
+		req.AllowAutoTopicCreation = allowAutoTopicCreation
+		atomic.StoreInt64(&client.updateMetadataMs, time.Now().UnixMilli())
 
 		response, err := broker.GetMetadata(req)
 		var kerror KError
 		var packetEncodingError PacketEncodingError
 		if err == nil {
+			// When talking to the startup phase of a broker, it is possible to receive an empty metadata set. We should remove that broker and try next broker (https://issues.apache.org/jira/browse/KAFKA-7924).
+			if len(response.Brokers) == 0 {
+				Logger.Println("client/metadata receiving empty brokers from the metadata response when requesting the broker #%d at %s", broker.ID(), broker.addr)
+				_ = broker.Close()
+				client.deregisterBroker(broker)
+				continue
+			}
 			allKnownMetaData := len(topics) == 0
 			// valid response, use it
 			shouldRetry, err := client.updateMetadata(response, allKnownMetaData)
@@ -1045,6 +1119,15 @@ func (client *client) cachedCoordinator(consumerGroup string) *Broker {
 	return nil
 }
 
+func (client *client) cachedTransactionCoordinator(transactionID string) *Broker {
+	client.lock.RLock()
+	defer client.lock.RUnlock()
+	if coordinatorID, ok := client.transactionCoordinators[transactionID]; ok {
+		return client.brokers[coordinatorID]
+	}
+	return nil
+}
+
 func (client *client) cachedController() *Broker {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
@@ -1061,24 +1144,34 @@ func (client *client) computeBackoff(attemptsRemaining int) time.Duration {
 	return client.conf.Metadata.Retry.Backoff
 }
 
-func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemaining int) (*FindCoordinatorResponse, error) {
+func (client *client) findCoordinator(coordinatorKey string, coordinatorType CoordinatorType, attemptsRemaining int) (*FindCoordinatorResponse, error) {
 	retry := func(err error) (*FindCoordinatorResponse, error) {
 		if attemptsRemaining > 0 {
 			backoff := client.computeBackoff(attemptsRemaining)
+			attemptsRemaining--
 			Logger.Printf("client/coordinator retrying after %dms... (%d attempts remaining)\n", backoff/time.Millisecond, attemptsRemaining)
 			time.Sleep(backoff)
-			return client.getConsumerMetadata(consumerGroup, attemptsRemaining-1)
+			return client.findCoordinator(coordinatorKey, coordinatorType, attemptsRemaining)
 		}
 		return nil, err
 	}
 
 	brokerErrors := make([]error, 0)
-	for broker := client.anyBroker(); broker != nil; broker = client.anyBroker() {
-		DebugLogger.Printf("client/coordinator requesting coordinator for consumergroup %s from %s\n", consumerGroup, broker.Addr())
+	for broker := client.LeastLoadedBroker(); broker != nil; broker = client.LeastLoadedBroker() {
+		DebugLogger.Printf("client/coordinator requesting coordinator for %s from %s\n", coordinatorKey, broker.Addr())
 
 		request := new(FindCoordinatorRequest)
-		request.CoordinatorKey = consumerGroup
-		request.CoordinatorType = CoordinatorGroup
+		request.CoordinatorKey = coordinatorKey
+		request.CoordinatorType = coordinatorType
+
+		// Version 1 adds KeyType.
+		if client.conf.Version.IsAtLeast(V0_11_0_0) {
+			request.Version = 1
+		}
+		// Version 2 is the same as version 1.
+		if client.conf.Version.IsAtLeast(V2_0_0_0) {
+			request.Version = 2
+		}
 
 		response, err := broker.FindCoordinator(request)
 		if err != nil {
@@ -1096,10 +1189,10 @@ func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemainin
 		}
 
 		if errors.Is(response.Err, ErrNoError) {
-			DebugLogger.Printf("client/coordinator coordinator for consumergroup %s is #%d (%s)\n", consumerGroup, response.Coordinator.ID(), response.Coordinator.Addr())
+			DebugLogger.Printf("client/coordinator coordinator for %s is #%d (%s)\n", coordinatorKey, response.Coordinator.ID(), response.Coordinator.Addr())
 			return response, nil
 		} else if errors.Is(response.Err, ErrConsumerCoordinatorNotAvailable) {
-			Logger.Printf("client/coordinator coordinator for consumer group %s is not available\n", consumerGroup)
+			Logger.Printf("client/coordinator coordinator for %s is not available\n", coordinatorKey)
 
 			// This is very ugly, but this scenario will only happen once per cluster.
 			// The __consumer_offsets topic only has to be created one time.
@@ -1108,10 +1201,16 @@ func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemainin
 				Logger.Printf("client/coordinator the __consumer_offsets topic is not initialized completely yet. Waiting 2 seconds...\n")
 				time.Sleep(2 * time.Second)
 			}
+			if coordinatorType == CoordinatorTransaction {
+				if _, err := client.Leader("__transaction_state", 0); err != nil {
+					Logger.Printf("client/coordinator the __transaction_state topic is not initialized completely yet. Waiting 2 seconds...\n")
+					time.Sleep(2 * time.Second)
+				}
+			}
 
 			return retry(ErrConsumerCoordinatorNotAvailable)
 		} else if errors.Is(response.Err, ErrGroupAuthorizationFailed) {
-			Logger.Printf("client was not authorized to access group %s while attempting to find coordinator", consumerGroup)
+			Logger.Printf("client was not authorized to access group %s while attempting to find coordinator", coordinatorKey)
 			return retry(ErrGroupAuthorizationFailed)
 		} else {
 			return nil, response.Err
@@ -1121,6 +1220,53 @@ func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemainin
 	Logger.Println("client/coordinator no available broker to send consumer metadata request to")
 	client.resurrectDeadBrokers()
 	return retry(Wrap(ErrOutOfBrokers, brokerErrors...))
+}
+
+func (client *client) resolveCanonicalNames(addrs []string) ([]string, error) {
+	ctx := context.Background()
+
+	dialer := client.Config().getDialer()
+	resolver := net.Resolver{
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// dial func should only be called once, so switching within is acceptable
+			switch d := dialer.(type) {
+			case proxy.ContextDialer:
+				return d.DialContext(ctx, network, address)
+			default:
+				// we have no choice but to ignore the context
+				return d.Dial(network, address)
+			}
+		},
+	}
+
+	canonicalAddrs := make(map[string]struct{}, len(addrs)) // dedupe as we go
+	for _, addr := range addrs {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err // message includes addr
+		}
+
+		ips, err := resolver.LookupHost(ctx, host)
+		if err != nil {
+			return nil, err // message includes host
+		}
+		for _, ip := range ips {
+			ptrs, err := resolver.LookupAddr(ctx, ip)
+			if err != nil {
+				return nil, err // message includes ip
+			}
+
+			// unlike the Java client, we do not further check that PTRs resolve
+			ptr := strings.TrimSuffix(ptrs[0], ".") // trailing dot breaks GSSAPI
+			canonicalAddrs[net.JoinHostPort(ptr, port)] = struct{}{}
+		}
+	}
+
+	addrs = make([]string, 0, len(canonicalAddrs))
+	for addr := range canonicalAddrs {
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
 }
 
 // nopCloserClient embeds an existing Client, but disables

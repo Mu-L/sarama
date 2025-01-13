@@ -34,6 +34,19 @@ const (
 	SourceDefault
 )
 
+type DescribeConfigError struct {
+	Err    KError
+	ErrMsg string
+}
+
+func (c *DescribeConfigError) Error() string {
+	text := c.Err.Error()
+	if c.ErrMsg != "" {
+		text = fmt.Sprintf("%s - %s", text, c.ErrMsg)
+	}
+	return text
+}
+
 type DescribeConfigsResponse struct {
 	Version      int16
 	ThrottleTime time.Duration
@@ -116,15 +129,25 @@ func (r *DescribeConfigsResponse) headerVersion() int16 {
 	return 0
 }
 
+func (r *DescribeConfigsResponse) isValidVersion() bool {
+	return r.Version >= 0 && r.Version <= 2
+}
+
 func (r *DescribeConfigsResponse) requiredVersion() KafkaVersion {
 	switch r.Version {
-	case 1:
-		return V1_0_0_0
 	case 2:
 		return V2_0_0_0
-	default:
+	case 1:
+		return V1_1_0_0
+	case 0:
 		return V0_11_0_0
+	default:
+		return V2_0_0_0
 	}
+}
+
+func (r *DescribeConfigsResponse) throttleTime() time.Duration {
+	return r.ThrottleTime
 }
 
 func (r *ResourceResponse) encode(pe packetEncoder, version int16) (err error) {

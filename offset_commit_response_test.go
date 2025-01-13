@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -28,7 +30,7 @@ var (
 )
 
 func TestEmptyOffsetCommitResponse(t *testing.T) {
-	//groupInstanceId := "gid"
+	// groupInstanceId := "gid"
 	tests := []struct {
 		CaseName     string
 		Version      int16

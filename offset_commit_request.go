@@ -201,26 +201,34 @@ func (r *OffsetCommitRequest) headerVersion() int16 {
 	return 1
 }
 
+func (r *OffsetCommitRequest) isValidVersion() bool {
+	return r.Version >= 0 && r.Version <= 7
+}
+
 func (r *OffsetCommitRequest) requiredVersion() KafkaVersion {
 	switch r.Version {
-	case 1:
-		return V0_8_2_0
-	case 2:
-		return V0_9_0_0
-	case 3:
-		return V0_11_0_0
-	case 4:
-		return V2_0_0_0
-	case 5, 6:
-		return V2_1_0_0
 	case 7:
 		return V2_3_0_0
+	case 5, 6:
+		return V2_1_0_0
+	case 4:
+		return V2_0_0_0
+	case 3:
+		return V0_11_0_0
+	case 2:
+		return V0_9_0_0
+	case 0, 1:
+		return V0_8_2_0
 	default:
-		return MinVersion
+		return V2_4_0_0
 	}
 }
 
-func (r *OffsetCommitRequest) AddBlock(topic string, partitionID int32, offset int64, leaderEpoch int32, timestamp int64, metadata string) {
+func (r *OffsetCommitRequest) AddBlock(topic string, partitionID int32, offset int64, timestamp int64, metadata string) {
+	r.AddBlockWithLeaderEpoch(topic, partitionID, offset, 0, timestamp, metadata)
+}
+
+func (r *OffsetCommitRequest) AddBlockWithLeaderEpoch(topic string, partitionID int32, offset int64, leaderEpoch int32, timestamp int64, metadata string) {
 	if r.blocks == nil {
 		r.blocks = make(map[string]map[int32]*offsetCommitRequestBlock)
 	}

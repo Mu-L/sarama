@@ -1,13 +1,28 @@
+//go:build !functional
+
 package sarama
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/rcrowley/go-metrics"
+	assert "github.com/stretchr/testify/require"
 )
+
+// NewTestConfig returns a config meant to be used by tests.
+// Due to inconsistencies with the request versions the clients send using the default Kafka version
+// and the response versions our mocks use, we default to the minimum Kafka version in most tests
+func NewTestConfig() *Config {
+	config := NewConfig()
+	config.Consumer.Retry.Backoff = 0
+	config.Producer.Retry.Backoff = 0
+	config.Version = MinVersion
+	return config
+}
 
 func TestDefaultConfigValidates(t *testing.T) {
 	config := NewTestConfig()
@@ -19,23 +34,23 @@ func TestDefaultConfigValidates(t *testing.T) {
 	}
 }
 
-func TestInvalidClientIDConfigValidates(t *testing.T) {
-	config := NewTestConfig()
-	config.ClientID = "foo:bar"
-	err := config.Validate()
-	var target ConfigurationError
-	if !errors.As(err, &target) || string(target) != "ClientID is invalid" {
-		t.Error("Expected invalid ClientID, got ", err)
-	}
-}
-
-func TestEmptyClientIDConfigValidates(t *testing.T) {
-	config := NewTestConfig()
-	config.ClientID = ""
-	err := config.Validate()
-	var target ConfigurationError
-	if !errors.As(err, &target) || string(target) != "ClientID is invalid" {
-		t.Error("Expected invalid ClientID, got ", err)
+// TestInvalidClientIDValidated ensures that the ClientID field is checked
+// when Version is set to anything less than 1_0_0_0, but otherwise accepted
+func TestInvalidClientIDValidated(t *testing.T) {
+	for _, version := range SupportedVersions {
+		for _, clientID := range []string{"", "foo:bar", "foo|bar"} {
+			config := NewTestConfig()
+			config.ClientID = clientID
+			config.Version = version
+			err := config.Validate()
+			if config.Version.IsAtLeast(V1_0_0_0) {
+				assert.NoError(t, err)
+				continue
+			}
+			var target ConfigurationError
+			assert.ErrorAs(t, err, &target)
+			assert.ErrorContains(t, err, fmt.Sprintf("ClientID value %q is not valid for Kafka versions before 1.0.0", clientID))
+		}
 	}
 }
 
@@ -162,7 +177,7 @@ func TestNetConfigValidates(t *testing.T) {
 				cfg.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
 			},
 			"Net.SASL.GSSAPI.KeyTabPath must not be empty when GSS-API mechanism is used" +
-				" and  Net.SASL.GSSAPI.AuthType = KRB5_KEYTAB_AUTH",
+				" and Net.SASL.GSSAPI.AuthType = KRB5_KEYTAB_AUTH",
 		},
 		{
 			"SASL.Mechanism GSSAPI (Kerberos) - Missing username",
@@ -201,7 +216,7 @@ func TestNetConfigValidates(t *testing.T) {
 				cfg.Net.SASL.GSSAPI.Realm = "kafka"
 				cfg.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
 			},
-			"Net.SASL.GSSAPI.AuthType is invalid. Possible values are KRB5_USER_AUTH and KRB5_KEYTAB_AUTH",
+			"Net.SASL.GSSAPI.AuthType is invalid. Possible values are KRB5_USER_AUTH, KRB5_KEYTAB_AUTH, and KRB5_CCACHE_AUTH",
 		},
 		{
 			"SASL.Mechanism GSSAPI (Kerberos) - Missing KerberosConfigPath",
@@ -228,6 +243,18 @@ func TestNetConfigValidates(t *testing.T) {
 				cfg.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
 			},
 			"Net.SASL.GSSAPI.Realm must not be empty when GSS-API mechanism is used",
+		},
+		{
+			"SASL.Mechanism GSSAPI (Kerberos) - Using Credentials Cache, Missing CCachePath field",
+			func(cfg *Config) {
+				cfg.Net.SASL.Enable = true
+				cfg.Net.SASL.GSSAPI.ServiceName = "kafka"
+				cfg.Net.SASL.Mechanism = SASLTypeGSSAPI
+				cfg.Net.SASL.GSSAPI.AuthType = KRB5_CCACHE_AUTH
+				cfg.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
+			},
+			"Net.SASL.GSSAPI.CCachePath must not be empty when GSS-API mechanism is used" +
+				" and Net.SASL.GSSAPI.AuthType = KRB5_CCACHE_AUTH",
 		},
 	}
 
@@ -543,6 +570,14 @@ func TestGroupInstanceIdAndVersionValidation(t *testing.T) {
 	config.Version = V2_3_0_0
 	if err := config.Validate(); err != nil {
 		t.Error("Expected group instance to work, got ", err)
+	}
+}
+
+func TestConsumerGroupStrategyCompatibility(t *testing.T) {
+	config := NewTestConfig()
+	config.Consumer.Group.Rebalance.Strategy = NewBalanceStrategySticky()
+	if err := config.Validate(); err != nil {
+		t.Error("Expected passing config validation, got ", err)
 	}
 }
 

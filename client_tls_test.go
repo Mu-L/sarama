@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -175,6 +177,7 @@ func TestTLS(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			doListenerTLSTest(t, tc.Succeed, tc.Server, tc.Client)
 		})
 	}
@@ -196,7 +199,9 @@ func doListenerTLSTest(t *testing.T, expectSuccess bool, serverConfig, clientCon
 	seedBroker := NewMockBrokerListener(childT, 1, seedListener)
 	defer seedBroker.Close()
 
-	seedBroker.Returns(new(MetadataResponse))
+	metadataResponse := new(MetadataResponse)
+	metadataResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
+	seedBroker.Returns(metadataResponse)
 
 	config := NewTestConfig()
 	config.Net.TLS.Enable = true

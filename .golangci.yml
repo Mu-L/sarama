@@ -1,4 +1,5 @@
 run:
+  go: "1.20"
   timeout: 5m
   deadline: 10m
 
@@ -19,60 +20,67 @@ linters-settings:
   misspell:
     locale: US
   goimports:
-    local-prefixes: github.com/Shopify/sarama
+    local-prefixes: github.com/IBM/sarama
   gocritic:
     enabled-tags:
       - diagnostic
-      - experimental
-      - opinionated
       - performance
-      - style
+      # - experimental
+      # - opinionated
+      # - style
+    enabled-checks:
+      - importShadow
+      - nestingReduce
+      - stringsCompare
+      # - unnamedResult
+      # - whyNoLint
     disabled-checks:
-      - wrapperFunc
+      - assignOp
+      - appendAssign
+      - commentedOutCode
+      - hugeParam
       - ifElseChain
+      - singleCaseSwitch
+      - sloppyReassign
   funlen:
     lines: 300
     statements: 300
+
+  depguard:
+    rules:
+      main:
+        deny:
+          - pkg: "io/ioutil"
+            desc: Use the "io" and "os" packages instead.
 
 linters:
   disable-all: true
   enable:
     - bodyclose
-    - deadcode
     - depguard
-    - exportloopref
+    # - copyloopvar
     - dogsled
-    # - dupl
     - errcheck
     - errorlint
     - funlen
     - gochecknoinits
-    # - goconst
-    # - gocritic
+    - gocritic
     - gocyclo
     - gofmt
     - goimports
-    # - golint
     - gosec
-    # - gosimple
     - govet
-    # - ineffassign
     - misspell
-    # - nakedret
     - nilerr
-    # - paralleltest
-    # - scopelint
     - staticcheck
-    - structcheck
-    # - stylecheck
     - typecheck
     - unconvert
     - unused
-    - varcheck
     - whitespace
 
 issues:
   exclude:
+    - "G115: integer overflow conversion"
     - "G404: Use of weak random number generator"
   exclude-rules:
     # exclude some linters from running on certains files.

@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -42,6 +44,16 @@ var (
 		0, 0, 0, 3, 0x01, 0x02, 0x03, // Userdata
 		0, 0, 0, 0, // OwnedPartitions KIP-429
 	}
+
+	groupMemberMetadataV3NilOwned = []byte{
+		0, 3, // Version
+		0, 0, 0, 1, // Topic array length
+		0, 3, 'o', 'n', 'e', // Topic one
+		0, 0, 0, 3, 0x01, 0x02, 0x03, // Userdata
+		0, 0, 0, 0, // OwnedPartitions KIP-429
+		0, 0, 0, 64, // GenerationID
+		0, 4, 'r', 'a', 'c', 'k', // RackID
+	}
 )
 
 func TestConsumerGroupMemberMetadata(t *testing.T) {
@@ -59,7 +71,7 @@ func TestConsumerGroupMemberMetadata(t *testing.T) {
 	}
 
 	meta2 := new(ConsumerGroupMemberMetadata)
-	err = decode(buf, meta2)
+	err = decode(buf, meta2, nil)
 	if err != nil {
 		t.Error("Failed to decode data", err)
 	} else if !reflect.DeepEqual(meta, meta2) {
@@ -69,11 +81,18 @@ func TestConsumerGroupMemberMetadata(t *testing.T) {
 
 func TestConsumerGroupMemberMetadataV1Decode(t *testing.T) {
 	meta := new(ConsumerGroupMemberMetadata)
-	if err := decode(groupMemberMetadataV1, meta); err != nil {
+	if err := decode(groupMemberMetadataV1, meta, nil); err != nil {
 		t.Error("Failed to decode V1 data", err)
 	}
-	if err := decode(groupMemberMetadataV1Bad, meta); err != nil {
+	if err := decode(groupMemberMetadataV1Bad, meta, nil); err != nil {
 		t.Error("Failed to decode V1 'bad' data", err)
+	}
+}
+
+func TestConsumerGroupMemberMetadataV3Decode(t *testing.T) {
+	meta := new(ConsumerGroupMemberMetadata)
+	if err := decode(groupMemberMetadataV3NilOwned, meta, nil); err != nil {
+		t.Error("Failed to decode V3 data", err)
 	}
 }
 
@@ -94,7 +113,7 @@ func TestConsumerGroupMemberAssignment(t *testing.T) {
 	}
 
 	amt2 := new(ConsumerGroupMemberAssignment)
-	err = decode(buf, amt2)
+	err = decode(buf, amt2, nil)
 	if err != nil {
 		t.Error("Failed to decode data", err)
 	} else if !reflect.DeepEqual(amt, amt2) {

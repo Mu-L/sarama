@@ -1,10 +1,12 @@
 //go:build functional
-// +build functional
 
 package sarama
 
 import (
+	"context"
 	"testing"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 func TestFuncAdminQuotas(t *testing.T) {
@@ -17,12 +19,13 @@ func TestFuncAdminQuotas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	config := NewTestConfig()
+	config := NewFunctionalTestConfig()
 	config.Version = kafkaVersion
 	adminClient, err := NewClusterAdmin(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer safeClose(t, adminClient)
 
 	// Check that we can read the quotas, and that they are empty
 	quotas, err := adminClient.DescribeClientQuotas(nil, false)
@@ -137,21 +140,22 @@ func TestFuncAdminDescribeGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	config := NewTestConfig()
+	config := NewFunctionalTestConfig()
 	config.Version = kafkaVersion
 	adminClient, err := NewClusterAdmin(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer safeClose(t, adminClient)
 
-	config1 := NewTestConfig()
+	config1 := NewFunctionalTestConfig()
 	config1.ClientID = "M1"
 	config1.Version = V2_3_0_0
 	config1.Consumer.Offsets.Initial = OffsetNewest
 	m1 := runTestFuncConsumerGroupMemberWithConfig(t, config1, group1, 100, nil, "test.4")
 	defer m1.Close()
 
-	config2 := NewTestConfig()
+	config2 := NewFunctionalTestConfig()
 	config2.ClientID = "M2"
 	config2.Version = V2_3_0_0
 	config2.Consumer.Offsets.Initial = OffsetNewest
@@ -178,4 +182,77 @@ func TestFuncAdminDescribeGroups(t *testing.T) {
 
 	m1.AssertCleanShutdown()
 	m2.AssertCleanShutdown()
+}
+
+func TestFuncAdminListConsumerGroupOffsets(t *testing.T) {
+	checkKafkaVersion(t, "0.8.2.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	config := NewFunctionalTestConfig()
+	config.ClientID = t.Name()
+	client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	defer safeClose(t, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	group := testFuncConsumerGroupID(t)
+	consumerGroup, err := NewConsumerGroupFromClient(group, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, consumerGroup)
+
+	offsetMgr, _ := NewOffsetManagerFromClient(group, client)
+	defer safeClose(t, offsetMgr)
+	markOffset(t, offsetMgr, "test.4", 0, 2)
+	offsetMgr.Commit()
+
+	coordinator, err := client.Coordinator(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("coordinator broker %d", coordinator.id)
+
+	adminClient, err := NewClusterAdminFromClient(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	{
+		resp, err := adminClient.ListConsumerGroupOffsets(group, map[string][]int32{"test.4": {0, 1, 2, 3}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(spew.Sdump(resp))
+	}
+
+	brokerID := coordinator.id
+	if err := stopDockerTestBroker(context.Background(), brokerID); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(
+		func() {
+			if err := startDockerTestBroker(context.Background(), brokerID); err != nil {
+				t.Fatal(err)
+			}
+		},
+	)
+
+	{
+		resp, err := adminClient.ListConsumerGroupOffsets(group, map[string][]int32{"test.4": {0, 1, 2, 3}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(spew.Sdump(resp))
+	}
+
+	coordinator, err = adminClient.Coordinator(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("coordinator broker %d", coordinator.id)
 }

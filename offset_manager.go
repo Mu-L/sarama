@@ -153,11 +153,8 @@ func (om *offsetManager) fetchInitialOffset(topic string, partition int32, retri
 		return om.fetchInitialOffset(topic, partition, retries-1)
 	}
 
-	req := new(OffsetFetchRequest)
-	req.Version = 1
-	req.ConsumerGroup = om.group
-	req.AddPartition(topic, partition)
-
+	partitions := map[string][]int32{topic: {partition}}
+	req := NewOffsetFetchRequest(om.conf.Version, om.group, partitions)
 	resp, err := broker.FetchOffset(req)
 	if err != nil {
 		if retries <= 0 {
@@ -254,18 +251,23 @@ func (om *offsetManager) Commit() {
 }
 
 func (om *offsetManager) flushToBroker() {
-	req := om.constructRequest()
-	if req == nil {
-		return
-	}
-
 	broker, err := om.coordinator()
 	if err != nil {
 		om.handleError(err)
 		return
 	}
 
-	resp, err := broker.CommitOffset(req)
+	// Care needs to be taken to unlock this. Don't want to defer the unlock as this would
+	// cause the lock to be held while waiting for the broker to reply.
+	broker.lock.Lock()
+	req := om.constructRequest()
+	if req == nil {
+		broker.lock.Unlock()
+		return
+	}
+	resp, rp, err := sendOffsetCommit(broker, req)
+	broker.lock.Unlock()
+
 	if err != nil {
 		om.handleError(err)
 		om.releaseCoordinator(broker)
@@ -273,27 +275,76 @@ func (om *offsetManager) flushToBroker() {
 		return
 	}
 
+	err = handleResponsePromise(req, resp, rp, nil)
+	if err != nil {
+		om.handleError(err)
+		om.releaseCoordinator(broker)
+		_ = broker.Close()
+		return
+	}
+
+	broker.handleThrottledResponse(resp)
 	om.handleResponse(broker, req, resp)
 }
 
+func sendOffsetCommit(coordinator *Broker, req *OffsetCommitRequest) (*OffsetCommitResponse, *responsePromise, error) {
+	resp := new(OffsetCommitResponse)
+	responseHeaderVersion := resp.headerVersion()
+	promise, err := coordinator.send(req, true, responseHeaderVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, promise, nil
+}
+
 func (om *offsetManager) constructRequest() *OffsetCommitRequest {
-	var r *OffsetCommitRequest
-	var perPartitionTimestamp int64
-	if om.conf.Consumer.Offsets.Retention == 0 {
-		perPartitionTimestamp = ReceiveTime
-		r = &OffsetCommitRequest{
-			Version:                 1,
-			ConsumerGroup:           om.group,
-			ConsumerID:              om.memberID,
-			ConsumerGroupGeneration: om.generation,
-		}
-	} else {
-		r = &OffsetCommitRequest{
-			Version:                 2,
-			RetentionTime:           int64(om.conf.Consumer.Offsets.Retention / time.Millisecond),
-			ConsumerGroup:           om.group,
-			ConsumerID:              om.memberID,
-			ConsumerGroupGeneration: om.generation,
+	r := &OffsetCommitRequest{
+		Version:                 1,
+		ConsumerGroup:           om.group,
+		ConsumerID:              om.memberID,
+		ConsumerGroupGeneration: om.generation,
+	}
+	// Version 1 adds timestamp and group membership information, as well as the commit timestamp.
+	//
+	// Version 2 adds retention time.  It removes the commit timestamp added in version 1.
+	if om.conf.Version.IsAtLeast(V0_9_0_0) {
+		r.Version = 2
+	}
+	// Version 3 and 4 are the same as version 2.
+	if om.conf.Version.IsAtLeast(V0_11_0_0) {
+		r.Version = 3
+	}
+	if om.conf.Version.IsAtLeast(V2_0_0_0) {
+		r.Version = 4
+	}
+	// Version 5 removes the retention time, which is now controlled only by a broker configuration.
+	//
+	// Version 6 adds the leader epoch for fencing.
+	if om.conf.Version.IsAtLeast(V2_1_0_0) {
+		r.Version = 6
+	}
+	// version 7 adds a new field called groupInstanceId to indicate member identity across restarts.
+	if om.conf.Version.IsAtLeast(V2_3_0_0) {
+		r.Version = 7
+		r.GroupInstanceId = om.groupInstanceId
+	}
+
+	// commit timestamp was only briefly supported in V1 where we set it to
+	// ReceiveTime (-1) to tell the broker to set it to the time when the commit
+	// request was received
+	var commitTimestamp int64
+	if r.Version == 1 {
+		commitTimestamp = ReceiveTime
+	}
+
+	// request controlled retention was only supported from V2-V4 (it became
+	// broker-only after that) so if the user has set the config options then
+	// flow those through as retention time on the commit request.
+	if r.Version >= 2 && r.Version < 5 {
+		// Map Sarama's default of 0 to Kafka's default of -1
+		r.RetentionTime = -1
+		if om.conf.Consumer.Offsets.Retention > 0 {
+			r.RetentionTime = int64(om.conf.Consumer.Offsets.Retention / time.Millisecond)
 		}
 	}
 
@@ -304,15 +355,10 @@ func (om *offsetManager) constructRequest() *OffsetCommitRequest {
 		for _, pom := range topicManagers {
 			pom.lock.Lock()
 			if pom.dirty {
-				r.AddBlock(pom.topic, pom.partition, pom.offset, pom.leaderEpoch, perPartitionTimestamp, pom.metadata)
+				r.AddBlockWithLeaderEpoch(pom.topic, pom.partition, pom.offset, pom.leaderEpoch, commitTimestamp, pom.metadata)
 			}
 			pom.lock.Unlock()
 		}
-	}
-
-	if om.groupInstanceId != nil {
-		r.Version = 7
-		r.GroupInstanceId = om.groupInstanceId
 	}
 
 	if len(r.blocks) > 0 {
@@ -359,13 +405,13 @@ func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest
 				// nothing wrong but we didn't commit, we'll get it next time round
 			case ErrFencedInstancedId:
 				pom.handleError(err)
-				// TODO close the whole consumer for instacne fenced....
+				// TODO close the whole consumer for instance fenced....
 				om.tryCancelSession()
 			case ErrUnknownTopicOrPartition:
 				// let the user know *and* try redispatching - if topic-auto-create is
 				// enabled, redispatching should trigger a metadata req and create the
 				// topic; if not then re-dispatching won't help, but we've let the user
-				// know and it shouldn't hurt either (see https://github.com/Shopify/sarama/issues/706)
+				// know and it shouldn't hurt either (see https://github.com/IBM/sarama/issues/706)
 				fallthrough
 			default:
 				// dunno, tell the user and try redispatching

@@ -4,14 +4,14 @@ A command line tool to test producer performance.
 
 ### Installation
 
-    go get github.com/Shopify/sarama/tools/kafka-producer-performance
+    go get github.com/IBM/sarama/tools/kafka-producer-performance
 
 
 ### Usage
 
     # Display all command line options
     kafka-producer-performance -help
-	
+
 	# Minimum invocation
     kafka-producer-performance \
 		-brokers=kafka:9092 \
