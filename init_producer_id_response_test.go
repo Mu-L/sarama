@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -19,6 +21,14 @@ var (
 		255, 255, 255, 255, 255, 255, 255, 255,
 		0, 0,
 	}
+
+	initProducerIdResponseWithTaggedFields = []byte{
+		0, 0, 0, 100,
+		0, 51,
+		255, 255, 255, 255, 255, 255, 255, 255,
+		0, 0,
+		0,
+	}
 )
 
 func TestInitProducerIDResponse(t *testing.T) {
@@ -34,4 +44,7 @@ func TestInitProducerIDResponse(t *testing.T) {
 	resp.ProducerID = -1
 
 	testResponse(t, "with error", resp, initProducerIDRequestError)
+
+	resp.Version = 2
+	testResponse(t, "with tagged fields", resp, initProducerIdResponseWithTaggedFields)
 }

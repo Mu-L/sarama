@@ -1,7 +1,6 @@
 package sarama
 
 import (
-	"compress/gzip"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -9,13 +8,16 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
 	"github.com/rcrowley/go-metrics"
 	"golang.org/x/net/proxy"
 )
 
 const defaultClientID = "sarama"
 
-var validID = regexp.MustCompile(`\A[A-Za-z0-9._-]+\z`)
+// validClientID specifies the permitted characters for a client.id when
+// connecting to Kafka versions before 1.0.0 (KIP-190)
+var validClientID = regexp.MustCompile(`\A[A-Za-z0-9._-]+\z`)
 
 // Config is used to pass multiple configuration options to Sarama's constructors.
 type Config struct {
@@ -49,6 +51,15 @@ type Config struct {
 		DialTimeout  time.Duration // How long to wait for the initial connection.
 		ReadTimeout  time.Duration // How long to wait for a response.
 		WriteTimeout time.Duration // How long to wait for a transmit.
+
+		// ResolveCanonicalBootstrapServers turns each bootstrap broker address
+		// into a set of IPs, then does a reverse lookup on each one to get its
+		// canonical hostname. This list of hostnames then replaces the
+		// original address list. Similar to the `client.dns.lookup` option in
+		// the JVM client, this is especially useful with GSSAPI, where it
+		// allows providing an alias record instead of individual broker
+		// hostnames. Defaults to false.
+		ResolveCanonicalBootstrapServers bool
 
 		TLS struct {
 			// Whether or not to use TLS when connecting to the broker
@@ -188,6 +199,28 @@ type Config struct {
 		// If enabled, the producer will ensure that exactly one copy of each message is
 		// written.
 		Idempotent bool
+		// Transaction specify
+		Transaction struct {
+			// Used in transactions to identify an instance of a producer through restarts
+			ID string
+			// Amount of time a transaction can remain unresolved (neither committed nor aborted)
+			// default is 1 min
+			Timeout time.Duration
+
+			Retry struct {
+				// The total number of times to retry sending a message (default 50).
+				// Similar to the `message.send.max.retries` setting of the JVM producer.
+				Max int
+				// How long to wait for the cluster to settle between retries
+				// (default 10ms). Similar to the `retry.backoff.ms` setting of the
+				// JVM producer.
+				Backoff time.Duration
+				// Called to compute backoff time dynamically. Useful for implementing
+				// more sophisticated backoff strategies. This takes precedence over
+				// `Backoff` if set.
+				BackoffFunc func(retries, maxRetries int) time.Duration
+			}
+		}
 
 		// Return specifies what channels will be populated. If they are set to true,
 		// you must read from the respective channels to prevent deadlock. If,
@@ -236,6 +269,13 @@ type Config struct {
 			// more sophisticated backoff strategies. This takes precedence over
 			// `Backoff` if set.
 			BackoffFunc func(retries, maxRetries int) time.Duration
+			// The maximum length of the bridging buffer between `input` and `retries` channels
+			// in AsyncProducer#retryHandler.
+			// The limit is to prevent this buffer from overflowing or causing OOM.
+			// Defaults to 0 for unlimited.
+			// Any value between 0 and 4096 is pushed to 4096.
+			// A zero or negative value indicates unlimited.
+			MaxBufferLength int
 		}
 
 		// Interceptors to be called when the producer dispatcher reads the
@@ -250,7 +290,6 @@ type Config struct {
 	// Consumer is the namespace for configuration related to consuming messages,
 	// used by the Consumer.
 	Consumer struct {
-
 		// Group is the namespace for configuring consumer group.
 		Group struct {
 			Session struct {
@@ -272,8 +311,17 @@ type Config struct {
 				Interval time.Duration
 			}
 			Rebalance struct {
-				// Strategy for allocating topic partitions to members (default BalanceStrategyRange)
+				// Strategy for allocating topic partitions to members.
+				// Deprecated: Strategy exists for historical compatibility
+				// and should not be used. Please use GroupStrategies.
 				Strategy BalanceStrategy
+
+				// GroupStrategies is the priority-ordered list of client-side consumer group
+				// balancing strategies that will be offered to the coordinator. The first
+				// strategy that all group members support will be chosen by the leader.
+				// default: [ NewBalanceStrategyRange() ]
+				GroupStrategies []BalanceStrategy
+
 				// The maximum allowed time for each worker to join the group once a rebalance has begun.
 				// This is basically a limit on the amount of time needed for all tasks to flush any pending
 				// data and commit offsets. If the timeout is exceeded, then the worker will be removed from
@@ -296,8 +344,17 @@ type Config struct {
 				// coordinator for the group.
 				UserData []byte
 			}
+
 			// support KIP-345
 			InstanceId string
+
+			// If true, consumer offsets will be automatically reset to configured Initial value
+			// if the fetched consumer offset is out of range of available offsets. Out of range
+			// can happen if the data has been deleted from the server, or during situations of
+			// under-replication where a replica does not have all the data yet. It can be
+			// dangerous to reset the offset automatically, particularly in the latter case. Defaults
+			// to true to maintain existing behavior.
+			ResetInvalidOffsets bool
 		}
 
 		Retry struct {
@@ -337,7 +394,7 @@ type Config struct {
 		// default is 250ms, since 0 causes the consumer to spin when no events are
 		// available. 100-500ms is a reasonable range for most cases. Kafka only
 		// supports precision up to milliseconds; nanoseconds will be truncated.
-		// Equivalent to the JVM's `fetch.wait.max.ms`.
+		// Equivalent to the JVM's `fetch.max.wait.ms`.
 		MaxWaitTime time.Duration
 
 		// The maximum amount of time the consumer expects a message takes to
@@ -465,7 +522,7 @@ func NewConfig() *Config {
 	c.Net.ReadTimeout = 30 * time.Second
 	c.Net.WriteTimeout = 30 * time.Second
 	c.Net.SASL.Handshake = true
-	c.Net.SASL.Version = SASLHandshakeV0
+	c.Net.SASL.Version = SASLHandshakeV1
 
 	c.Metadata.Retry.Max = 3
 	c.Metadata.Retry.Backoff = 250 * time.Millisecond
@@ -473,7 +530,7 @@ func NewConfig() *Config {
 	c.Metadata.Full = true
 	c.Metadata.AllowAutoTopicCreation = true
 
-	c.Producer.MaxMessageBytes = 1000000
+	c.Producer.MaxMessageBytes = 1024 * 1024
 	c.Producer.RequiredAcks = WaitForLocal
 	c.Producer.Timeout = 10 * time.Second
 	c.Producer.Partitioner = NewHashPartitioner
@@ -481,6 +538,10 @@ func NewConfig() *Config {
 	c.Producer.Retry.Backoff = 100 * time.Millisecond
 	c.Producer.Return.Errors = true
 	c.Producer.CompressionLevel = CompressionLevelDefault
+
+	c.Producer.Transaction.Timeout = 1 * time.Minute
+	c.Producer.Transaction.Retry.Max = 50
+	c.Producer.Transaction.Retry.Backoff = 100 * time.Millisecond
 
 	c.Consumer.Fetch.Min = 1
 	c.Consumer.Fetch.Default = 1024 * 1024
@@ -495,10 +556,11 @@ func NewConfig() *Config {
 
 	c.Consumer.Group.Session.Timeout = 10 * time.Second
 	c.Consumer.Group.Heartbeat.Interval = 3 * time.Second
-	c.Consumer.Group.Rebalance.Strategy = BalanceStrategyRange
+	c.Consumer.Group.Rebalance.GroupStrategies = []BalanceStrategy{NewBalanceStrategyRange()}
 	c.Consumer.Group.Rebalance.Timeout = 60 * time.Second
 	c.Consumer.Group.Rebalance.Retry.Max = 4
 	c.Consumer.Group.Rebalance.Retry.Backoff = 2 * time.Second
+	c.Consumer.Group.ResetInvalidOffsets = true
 
 	c.ClientID = defaultClientID
 	c.ChannelBufferSize = 256
@@ -511,6 +573,7 @@ func NewConfig() *Config {
 
 // Validate checks a Config instance. It will return a
 // ConfigurationError if the specified values don't make sense.
+//
 //nolint:gocyclo // This function's cyclomatic complexity has go beyond 100
 func (c *Config) Validate() error {
 	// some configuration values should be warned on but not fail completely, do those first
@@ -604,19 +667,26 @@ func (c *Config) Validate() error {
 				return ConfigurationError("Net.SASL.GSSAPI.ServiceName must not be empty when GSS-API mechanism is used")
 			}
 
-			if c.Net.SASL.GSSAPI.AuthType == KRB5_USER_AUTH {
+			switch c.Net.SASL.GSSAPI.AuthType {
+			case KRB5_USER_AUTH:
 				if c.Net.SASL.GSSAPI.Password == "" {
 					return ConfigurationError("Net.SASL.GSSAPI.Password must not be empty when GSS-API " +
 						"mechanism is used and Net.SASL.GSSAPI.AuthType = KRB5_USER_AUTH")
 				}
-			} else if c.Net.SASL.GSSAPI.AuthType == KRB5_KEYTAB_AUTH {
+			case KRB5_KEYTAB_AUTH:
 				if c.Net.SASL.GSSAPI.KeyTabPath == "" {
 					return ConfigurationError("Net.SASL.GSSAPI.KeyTabPath must not be empty when GSS-API mechanism is used" +
-						" and  Net.SASL.GSSAPI.AuthType = KRB5_KEYTAB_AUTH")
+						" and Net.SASL.GSSAPI.AuthType = KRB5_KEYTAB_AUTH")
 				}
-			} else {
-				return ConfigurationError("Net.SASL.GSSAPI.AuthType is invalid. Possible values are KRB5_USER_AUTH and KRB5_KEYTAB_AUTH")
+			case KRB5_CCACHE_AUTH:
+				if c.Net.SASL.GSSAPI.CCachePath == "" {
+					return ConfigurationError("Net.SASL.GSSAPI.CCachePath must not be empty when GSS-API mechanism is used" +
+						" and Net.SASL.GSSAPI.AuthType = KRB5_CCACHE_AUTH")
+				}
+			default:
+				return ConfigurationError("Net.SASL.GSSAPI.AuthType is invalid. Possible values are KRB5_USER_AUTH, KRB5_KEYTAB_AUTH, and KRB5_CCACHE_AUTH")
 			}
+
 			if c.Net.SASL.GSSAPI.KerberosConfigPath == "" {
 				return ConfigurationError("Net.SASL.GSSAPI.KerberosConfigPath must not be empty when GSS-API mechanism is used")
 			}
@@ -706,6 +776,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Producer.Transaction.ID != "" && !c.Producer.Idempotent {
+		return ConfigurationError("Transactional producer requires Idempotent to be true")
+	}
+
 	// validate the Consumer values
 	switch {
 	case c.Consumer.Fetch.Min <= 0:
@@ -734,6 +808,10 @@ func (c *Config) Validate() error {
 		Logger.Println("Deprecation warning: Consumer.Offsets.CommitInterval exists for historical compatibility" +
 			" and should not be used. Please use Consumer.Offsets.AutoCommit, the current value will be ignored")
 	}
+	if c.Consumer.Group.Rebalance.Strategy != nil {
+		Logger.Println("Deprecation warning: Consumer.Group.Rebalance.Strategy exists for historical compatibility" +
+			" and should not be used. Please use Consumer.Group.Rebalance.GroupStrategies")
+	}
 
 	// validate IsolationLevel
 	if c.Consumer.IsolationLevel == ReadCommitted && !c.Version.IsAtLeast(V0_11_0_0) {
@@ -748,8 +826,8 @@ func (c *Config) Validate() error {
 		return ConfigurationError("Consumer.Group.Heartbeat.Interval must be >= 1ms")
 	case c.Consumer.Group.Heartbeat.Interval >= c.Consumer.Group.Session.Timeout:
 		return ConfigurationError("Consumer.Group.Heartbeat.Interval must be < Consumer.Group.Session.Timeout")
-	case c.Consumer.Group.Rebalance.Strategy == nil:
-		return ConfigurationError("Consumer.Group.Rebalance.Strategy must not be empty")
+	case c.Consumer.Group.Rebalance.Strategy == nil && len(c.Consumer.Group.Rebalance.GroupStrategies) == 0:
+		return ConfigurationError("Consumer.Group.Rebalance.GroupStrategies or Consumer.Group.Rebalance.Strategy must not be empty")
 	case c.Consumer.Group.Rebalance.Timeout <= time.Millisecond:
 		return ConfigurationError("Consumer.Group.Rebalance.Timeout must be >= 1ms")
 	case c.Consumer.Group.Rebalance.Retry.Max < 0:
@@ -757,6 +835,13 @@ func (c *Config) Validate() error {
 	case c.Consumer.Group.Rebalance.Retry.Backoff < 0:
 		return ConfigurationError("Consumer.Group.Rebalance.Retry.Backoff must be >= 0")
 	}
+
+	for _, strategy := range c.Consumer.Group.Rebalance.GroupStrategies {
+		if strategy == nil {
+			return ConfigurationError("elements in Consumer.Group.Rebalance.Strategies must not be empty")
+		}
+	}
+
 	if c.Consumer.Group.InstanceId != "" {
 		if !c.Version.IsAtLeast(V2_3_0_0) {
 			return ConfigurationError("Consumer.Group.InstanceId need Version >= 2.3")
@@ -770,8 +855,11 @@ func (c *Config) Validate() error {
 	switch {
 	case c.ChannelBufferSize < 0:
 		return ConfigurationError("ChannelBufferSize must be >= 0")
-	case !validID.MatchString(c.ClientID):
-		return ConfigurationError("ClientID is invalid")
+	}
+
+	// only validate clientID locally for Kafka versions before KIP-190 was implemented
+	if !c.Version.IsAtLeast(V1_0_0_0) && !validClientID.MatchString(c.ClientID) {
+		return ConfigurationError(fmt.Sprintf("ClientID value %q is not valid for Kafka versions before 1.0.0", c.ClientID))
 	}
 
 	return nil
@@ -779,7 +867,7 @@ func (c *Config) Validate() error {
 
 func (c *Config) getDialer() proxy.Dialer {
 	if c.Net.Proxy.Enable {
-		Logger.Printf("using proxy %s", c.Net.Proxy.Dialer)
+		Logger.Println("using proxy")
 		return c.Net.Proxy.Dialer
 	} else {
 		return &net.Dialer{

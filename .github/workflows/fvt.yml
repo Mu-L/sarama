@@ -1,42 +1,79 @@
----
 name: FVT
-on: [push, pull_request]
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        required: false
+        type: string
+        default: 1.23.x
+      kafka-version:
+        required: false
+        type: string
+        default: 3.6.2
+      scala-version:
+        required: false
+        type: string
+        default: 2.13
+
+permissions:
+  contents: read  # for actions/checkout to fetch code
+
 jobs:
   fvt:
-    name: Test with Kafka ${{ matrix.kafka-version }}
+    name: Test with Kafka ${{ inputs.kafka-version }}
     runs-on: ubuntu-latest
-
-    # We want to run on external PRs, but not on our own internal PRs as they'll be run
-    # by the push to the branch.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: [1.18.x]
-        kafka-version: [2.8.1, 3.0.1, 3.1.0, 3.2.0]
     env:
       DEBUG: true
       GOFLAGS: -trimpath
-      KAFKA_VERSION: ${{ matrix.kafka-version }}
+      KAFKA_VERSION: ${{ inputs.kafka-version }}
+      SCALA_VERSION: ${{ inputs.scala-version }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
+    - name: Setup Docker
+      uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+      id: buildx
+    - name: Build FVT Docker Image
+      uses: docker/bake-action@60f5d53310314dbf8c33f0c8a01042536f2f6c36 # v6.2.0
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        files: docker-compose.yml
+        load: true
+        targets: kafka-1
+        set: |
+          *.cache-from=type=gha,scope=fvt-kafka-${{ inputs.kafka-version }}
+          *.cache-to=type=gha,scope=fvt-kafka-${{ inputs.kafka-version }},mode=max
     - name: Setup Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
       with:
-        go-version: ${{ matrix.go-version }}
-    - name: Get Go environment
-      id: go-env
+        go-version: ${{ inputs.go-version }}
+    - name: Setup Docker Compose
       run: |
-        echo "::set-output name=cache::$(go env GOCACHE)"
-        echo "::set-output name=modcache::$(go env GOMODCACHE)"
-    - name: Set up cache
-      uses: actions/cache@v2
-      with:
-        path: |
-          ${{ steps.go-env.outputs.cache }}
-          ${{ steps.go-env.outputs.modcache }}
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+        curl --fail -sSL "https://github.com/docker/compose/releases/download/v2.32.1/docker-compose-$(uname -s)-$(uname -m)" -o /tmp/docker-compose
+        mkdir -p $HOME/.docker/cli-plugins
+        install -m755 /tmp/docker-compose $HOME/.docker/cli-plugins
+        docker version --format 'Docker Engine version v{{.Server.Version}}'
+        docker compose version
     - name: Test (Functional)
-      run: make test_functional
+      run: |
+        nohup sudo tcpdump -i lo -w "fvt-kafka-${KAFKA_VERSION}.pcap" portrange 29091-29095 >/dev/null 2>&1 &
+        echo $! >tcpdump.pid
+        make test_functional
+        echo "## Code Coverage" >>$GITHUB_STEP_SUMMARY
+        echo "|Filename|Function|Coverage|" >>$GITHUB_STEP_SUMMARY
+        echo "|--------|--------|--------|" >>$GITHUB_STEP_SUMMARY
+        go tool cover -func=profile.out | sed -E -e 's/[[:space:]]+/|/g' -e 's/$/|/g' -e 's/^/|/g' >>$GITHUB_STEP_SUMMARY
+    - name: Stop tcpdump
+      if: always()
+      run: |
+        if [ -f "tcpdump.pid" ]; then sudo kill "$(cat tcpdump.pid)" || true; fi
+        if [ -f "fvt-kafka-${KAFKA_VERSION}.pcap" ]; then sudo chmod a+r "fvt-kafka-${KAFKA_VERSION}.pcap"; fi
+    - name: Upload pcap file
+      if: always()
+      uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+      with:
+        name: fvt-kafka-${{ inputs.kafka-version }}.pcap
+        path: fvt-kafka-${{ inputs.kafka-version }}.pcap
+        retention-days: 5
+        if-no-files-found: ignore

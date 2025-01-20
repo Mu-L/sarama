@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -98,6 +99,20 @@ func (b *MockBroker) SetHandlerByMap(handlerMap map[string]MockResponse) {
 	})
 }
 
+// SetHandlerFuncByMap defines mapping of Request types to RequestHandlerFunc. When a
+// request is received by the broker, it looks up the request type in the map
+// and invoke the found RequestHandlerFunc instance to generate an appropriate reply.
+func (b *MockBroker) SetHandlerFuncByMap(handlerMap map[string]requestHandlerFunc) {
+	fnMap := make(map[string]requestHandlerFunc)
+	for k, v := range handlerMap {
+		fnMap[k] = v
+	}
+	b.setHandler(func(req *request) (res encoderWithHeader) {
+		reqTypeName := reflect.TypeOf(req.body).Elem().Name()
+		return fnMap[reqTypeName](req)
+	})
+}
+
 // SetNotifier set a function that will get invoked whenever a request has been
 // processed successfully and will provide the number of bytes read and written
 func (b *MockBroker) SetNotifier(notifier RequestNotifierFunc) {
@@ -178,7 +193,9 @@ func (b *MockBroker) serverLoop() {
 		i++
 	}
 	wg.Wait()
-	Logger.Printf("*** mockbroker/%d: listener closed, err=%v", b.BrokerID(), err)
+	if !isConnectionClosedError(err) {
+		Logger.Printf("*** mockbroker/%d: listener closed, err=%v", b.BrokerID(), err)
+	}
 }
 
 func (b *MockBroker) SetGSSAPIHandler(handler GSSApiHandlerFunc) {
@@ -243,8 +260,10 @@ func (b *MockBroker) handleRequests(conn io.ReadWriteCloser, idx int, wg *sync.W
 	for {
 		buffer, err := b.readToBytes(conn)
 		if err != nil {
-			Logger.Printf("*** mockbroker/%d/%d: invalid request: err=%+v, %+v", b.brokerID, idx, err, spew.Sdump(buffer))
-			b.serverError(err)
+			if !isConnectionClosedError(err) {
+				Logger.Printf("*** mockbroker/%d/%d: invalid request: err=%+v, %+v", b.brokerID, idx, err, spew.Sdump(buffer))
+				b.serverError(err)
+			}
 			break
 		}
 
@@ -253,8 +272,10 @@ func (b *MockBroker) handleRequests(conn io.ReadWriteCloser, idx int, wg *sync.W
 			req, br, err := decodeRequest(bytes.NewReader(buffer))
 			bytesRead = br
 			if err != nil {
-				Logger.Printf("*** mockbroker/%d/%d: invalid request: err=%+v, %+v", b.brokerID, idx, err, spew.Sdump(req))
-				b.serverError(err)
+				if !isConnectionClosedError(err) {
+					Logger.Printf("*** mockbroker/%d/%d: invalid request: err=%+v, %+v", b.brokerID, idx, err, spew.Sdump(req))
+					b.serverError(err)
+				}
 				break
 			}
 
@@ -280,7 +301,7 @@ func (b *MockBroker) handleRequests(conn io.ReadWriteCloser, idx int, wg *sync.W
 
 			encodedRes, err := encode(res, nil)
 			if err != nil {
-				b.serverError(err)
+				b.serverError(fmt.Errorf("failed to encode %T - %w", res, err))
 				break
 			}
 			if len(encodedRes) == 0 {
@@ -358,21 +379,25 @@ func (b *MockBroker) defaultRequestHandler(req *request) (res encoderWithHeader)
 	}
 }
 
-func (b *MockBroker) serverError(err error) {
-	isConnectionClosedError := false
+func isConnectionClosedError(err error) bool {
+	var result bool
 	opError := &net.OpError{}
 	if errors.As(err, &opError) {
-		isConnectionClosedError = true
+		result = true
 	} else if errors.Is(err, io.EOF) {
-		isConnectionClosedError = true
+		result = true
 	} else if err.Error() == "use of closed network connection" {
-		isConnectionClosedError = true
+		result = true
 	}
 
-	if isConnectionClosedError {
+	return result
+}
+
+func (b *MockBroker) serverError(err error) {
+	b.t.Helper()
+	if isConnectionClosedError(err) {
 		return
 	}
-
 	b.t.Errorf(err.Error())
 }
 
@@ -386,10 +411,29 @@ func NewMockBroker(t TestReporter, brokerID int32) *MockBroker {
 // NewMockBrokerAddr behaves like newMockBroker but listens on the address you give
 // it rather than just some ephemeral port.
 func NewMockBrokerAddr(t TestReporter, brokerID int32, addr string) *MockBroker {
-	listener, err := net.Listen("tcp", addr)
+	var (
+		listener net.Listener
+		err      error
+	)
+
+	// retry up to 20 times if address already in use (e.g., if replacing broker which hasn't cleanly shutdown)
+	for i := 0; i < 20; i++ {
+		listener, err = net.Listen("tcp", addr)
+		if err != nil {
+			if errors.Is(err, syscall.EADDRINUSE) {
+				Logger.Printf("*** mockbroker/%d waiting for %s (address already in use)", brokerID, addr)
+				time.Sleep(time.Millisecond * 100)
+				continue
+			}
+			t.Fatal(err)
+		}
+		break
+	}
+
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return NewMockBrokerListener(t, brokerID, listener)
 }
 

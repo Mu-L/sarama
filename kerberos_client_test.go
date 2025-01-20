@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -120,6 +122,26 @@ func TestCreateWithKeyTab(t *testing.T) {
 	clientConfig.Net.SASL.GSSAPI.Username = "client"
 	clientConfig.Net.SASL.GSSAPI.AuthType = KRB5_KEYTAB_AUTH
 	clientConfig.Net.SASL.GSSAPI.KeyTabPath = "nonexist.keytab"
+	clientConfig.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
+	_, err = createClient(&clientConfig.Net.SASL.GSSAPI, kerberosConfig)
+	if err.Error() != expectedErr.Error() {
+		t.Errorf("Expected error:%s, got:%s.", err, expectedErr)
+	}
+}
+
+func TestCreateWithCredentialsCache(t *testing.T) {
+	kerberosConfig, err := krbcfg.NewFromString(krb5cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expect to try to create a client with a credentials cache and fails with "o such file or directory" error
+	expectedErr := errors.New("open nonexist.ccache: no such file or directory")
+	clientConfig := NewTestConfig()
+	clientConfig.Net.SASL.Mechanism = SASLTypeGSSAPI
+	clientConfig.Net.SASL.Enable = true
+	clientConfig.Net.SASL.GSSAPI.ServiceName = "kafka"
+	clientConfig.Net.SASL.GSSAPI.AuthType = KRB5_CCACHE_AUTH
+	clientConfig.Net.SASL.GSSAPI.CCachePath = "nonexist.ccache"
 	clientConfig.Net.SASL.GSSAPI.KerberosConfigPath = "/etc/krb5.conf"
 	_, err = createClient(&clientConfig.Net.SASL.GSSAPI, kerberosConfig)
 	if err.Error() != expectedErr.Error() {

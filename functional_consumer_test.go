@@ -1,5 +1,4 @@
 //go:build functional
-// +build functional
 
 package sarama
 
@@ -19,14 +18,14 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/rcrowley/go-metrics"
-	"github.com/stretchr/testify/require"
+	assert "github.com/stretchr/testify/require"
 )
 
 func TestFuncConsumerOffsetOutOfRange(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	consumer, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, NewTestConfig())
+	consumer, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, NewFunctionalTestConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +45,10 @@ func TestConsumerHighWaterMarkOffset(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	p, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, nil)
+	config := NewFunctionalTestConfig()
+	config.Producer.Return.Successes = true
+
+	p, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +59,7 @@ func TestConsumerHighWaterMarkOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, NewTestConfig())
+	c, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +129,7 @@ func TestVersionMatrixLZ4(t *testing.T) {
 
 // Support for zstd codec was introduced in v2.1.0.0
 func TestVersionMatrixZstd(t *testing.T) {
+	checkKafkaVersion(t, "2.1.0")
 	metrics.UseNilMetrics = true // disable Sarama's go-metrics library
 	t.Cleanup(func() {
 		metrics.UseNilMetrics = false
@@ -167,14 +170,13 @@ func TestReadOnlyAndAllCommittedMessages(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	config := NewTestConfig()
+	config := NewFunctionalTestConfig()
 	config.ClientID = t.Name()
 	config.Net.MaxOpenRequests = 1
 	config.Consumer.IsolationLevel = ReadCommitted
 	config.Producer.Idempotent = true
 	config.Producer.Return.Successes = true
 	config.Producer.RequiredAcks = WaitForAll
-	config.Version = V0_11_0_0
 
 	client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	if err != nil {
@@ -233,7 +235,8 @@ func TestReadOnlyAndAllCommittedMessages(t *testing.T) {
 	ps := &produceSet{
 		msgs: make(map[string]map[int32]*partitionSet),
 		parent: &asyncProducer{
-			conf: config,
+			conf:   config,
+			txnmgr: &transactionManager{},
 		},
 		producerID:    pidRes.ProducerID,
 		producerEpoch: pidRes.ProducerEpoch,
@@ -294,21 +297,20 @@ func TestReadOnlyAndAllCommittedMessages(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition(uncommittedTopic, 0, OffsetOldest)
-	require.NoError(t, err)
+	assert.NoError(t, err)
 
 	msgChannel := pc.Messages()
 	for i := 1; i <= 6; i++ {
 		msg := <-msgChannel
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
-		require.Equal(t, fmt.Sprintf("Committed %v", i), string(msg.Value))
+		assert.Equal(t, fmt.Sprintf("Committed %v", i), string(msg.Value))
 	}
 }
 
 func TestConsumerGroupDeadlock(t *testing.T) {
+	checkKafkaVersion(t, "1.1.0")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
-
-	require := require.New(t)
 
 	const topic = "test_consumer_group_rebalance_test_topic"
 	const msgQty = 50
@@ -316,16 +318,17 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-	config := NewConfig()
+	config := NewFunctionalTestConfig()
+	config.Version = V1_1_0_0
 	config.ClientID = t.Name()
 	config.Producer.Return.Successes = true
 	config.ChannelBufferSize = 2 * msgQty
 
 	client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	admin, err := NewClusterAdminFromClient(client)
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	cgName := "test_consumer_group_rebalance_consumer_group"
 
@@ -351,7 +354,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 		}
 		break
 	}
-	require.NoError(err)
+	assert.NoError(t, err)
 	defer func() {
 		_ = admin.DeleteTopic(topic)
 	}()
@@ -359,7 +362,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 	var wg sync.WaitGroup
 
 	consumer, err := NewConsumerFromClient(client)
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	ch := make(chan string, msgQty)
 	for i := 0; i < partitionsQty; i++ {
@@ -369,7 +372,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 			defer wg.Done()
 
 			pConsumer, err := consumer.ConsumePartition(topic, int32(i), OffsetOldest)
-			require.NoError(err)
+			assert.NoError(t, err)
 			defer pConsumer.Close()
 
 			for {
@@ -388,7 +391,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 	}
 
 	producer, err := NewSyncProducerFromClient(client)
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	for i := 0; i < msgQty; i++ {
 		msg := &ProducerMessage{
@@ -396,7 +399,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 			Value: StringEncoder(strconv.FormatInt(int64(i), 10)),
 		}
 		_, _, err := producer.SendMessage(msg)
-		require.NoError(err)
+		assert.NoError(t, err)
 	}
 
 	var received []string
@@ -414,16 +417,16 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 
 	cancel()
 
-	require.Equal(msgQty, len(received))
+	assert.Equal(t, msgQty, len(received))
 
 	err = producer.Close()
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	err = consumer.Close()
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	err = client.Close()
-	require.NoError(err)
+	assert.NoError(t, err)
 
 	wg.Wait()
 }
@@ -442,6 +445,13 @@ func versionRange(lower KafkaVersion) []KafkaVersion {
 	upper, err := ParseKafkaVersion(os.Getenv("KAFKA_VERSION"))
 	if err != nil {
 		upper = MaxVersion
+	}
+
+	// KIP-896 dictates a minimum lower bound of 2.1 protocol for Kafka 4.0 onwards
+	if upper.IsAtLeast(V4_0_0_0) {
+		if !lower.IsAtLeast(V2_1_0_0) {
+			lower = V2_1_0_0
+		}
 	}
 
 	versions := make([]KafkaVersion, 0, len(fvtRangeVersions))
@@ -466,7 +476,7 @@ func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []Compressi
 	g := errgroup.Group{}
 	for _, prodVer := range clientVersions {
 		for _, codec := range codecs {
-			prodCfg := NewTestConfig()
+			prodCfg := NewFunctionalTestConfig()
 			prodCfg.ClientID = t.Name() + "-Producer-" + prodVer.String()
 			if idempotent {
 				prodCfg.ClientID += "-idempotent"
@@ -531,7 +541,7 @@ func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []Compressi
 	sort.Slice(producedMessages, func(i, j int) bool {
 		return producedMessages[i].Offset < producedMessages[j].Offset
 	})
-	require.NotEmpty(t, producedMessages, "should have produced >0 messages")
+	assert.NotEmpty(t, producedMessages, "should have produced >0 messages")
 	t.Logf("*** Total produced %d, firstOffset=%d, lastOffset=%d\n",
 		len(producedMessages), producedMessages[0].Offset, producedMessages[len(producedMessages)-1].Offset)
 	return producedMessages
@@ -544,7 +554,7 @@ func consumeMsgs(t *testing.T, clientVersions []KafkaVersion, producedMessages [
 	for _, consVer := range clientVersions {
 		// Create a partition consumer that should start from the first produced
 		// message.
-		consCfg := NewTestConfig()
+		consCfg := NewFunctionalTestConfig()
 		consCfg.ClientID = t.Name() + "-Consumer-" + consVer.String()
 		consCfg.Consumer.MaxProcessingTime = time.Second
 		consCfg.Metadata.Full = false
@@ -553,12 +563,12 @@ func consumeMsgs(t *testing.T, clientVersions []KafkaVersion, producedMessages [
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer safeClose(t, c)
+		defer safeClose(t, c) //nolint: gocritic // the close intentionally happens outside the loop
 		pc, err := c.ConsumePartition("test.1", 0, producedMessages[0].Offset)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer safeClose(t, pc)
+		defer safeClose(t, pc) //nolint: gocritic // the close intentionally happens outside the loop
 
 		var wg sync.WaitGroup
 		wg.Add(1)

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 )
 
 // Consumer implements sarama's Consumer interface for testing purposes.
@@ -20,10 +20,14 @@ type Consumer struct {
 
 // NewConsumer returns a new mock Consumer instance. The t argument should
 // be the *testing.T instance of your test method. An error will be written to it if
-// an expectation is violated. The config argument can be set to nil.
+// an expectation is violated. The config argument can be set to nil; if it is
+// non-nil it is validated.
 func NewConsumer(t ErrorReporter, config *sarama.Config) *Consumer {
 	if config == nil {
 		config = sarama.NewConfig()
+	}
+	if err := config.Validate(); err != nil {
+		t.Errorf("Invalid mock configuration provided: %s", err.Error())
 	}
 
 	c := &Consumer{
@@ -200,8 +204,10 @@ func (c *Consumer) SetTopicMetadata(metadata map[string][]int32) {
 // The registered PartitionConsumer will be returned, so you can set expectations
 // on it using method chaining. Once a topic/partition is registered, you are
 // expected to start consuming it using ConsumePartition. If that doesn't happen,
-// an error will be written to the error reporter once the mock consumer is closed. It will
-// also expect that the
+// an error will be written to the error reporter once the mock consumer is closed. It also expects
+// that the message and error channels be written with YieldMessage and YieldError accordingly,
+// and be fully consumed once the mock consumer is closed if ExpectMessagesDrainedOnClose or
+// ExpectErrorsDrainedOnClose have been called.
 func (c *Consumer) ExpectConsumePartition(topic string, partition int32, offset int64) *PartitionConsumer {
 	c.l.Lock()
 	defer c.l.Unlock()
@@ -242,6 +248,7 @@ func (c *Consumer) ExpectConsumePartition(topic string, partition int32, offset 
 // channels using YieldMessage and YieldError.
 type PartitionConsumer struct {
 	highWaterMarkOffset           int64 // must be at the top of the struct because https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	suppressedHighWaterMarkOffset int64
 	l                             sync.Mutex
 	t                             ErrorReporter
 	topic                         string
@@ -249,7 +256,6 @@ type PartitionConsumer struct {
 	offset                        int64
 	messages                      chan *sarama.ConsumerMessage
 	suppressedMessages            chan *sarama.ConsumerMessage
-	suppressedHighWaterMarkOffset int64
 	errors                        chan *sarama.ConsumerError
 	singleClose                   sync.Once
 	consumed                      bool
@@ -339,7 +345,7 @@ func (pc *PartitionConsumer) Messages() <-chan *sarama.ConsumerMessage {
 }
 
 func (pc *PartitionConsumer) HighWaterMarkOffset() int64 {
-	return atomic.LoadInt64(&pc.highWaterMarkOffset) + 1
+	return atomic.LoadInt64(&pc.highWaterMarkOffset)
 }
 
 // Pause implements the Pause method from the sarama.PartitionConsumer interface.

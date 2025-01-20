@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 )
 
 // ErrorReporter is a simple interface that includes the testing.T methods we use to report
@@ -103,6 +103,8 @@ func (pc *TopicConfig) partitions(topic string) int32 {
 // and the response versions our mocks use, we default to the minimum Kafka version in most tests
 func NewTestConfig() *sarama.Config {
 	config := sarama.NewConfig()
+	config.Consumer.Retry.Backoff = 0
+	config.Producer.Retry.Backoff = 0
 	config.Version = sarama.MinVersion
 	return config
 }
